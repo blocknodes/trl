@@ -14,7 +14,7 @@ import os
 from tqdm import tqdm
 import sys
 import copy
-
+import argparse
 
 class KbpRetrievalClient:
     """
@@ -245,6 +245,26 @@ class TaskExecutionSystem:
         self.citation_chain = {}  # 存储引用链
         self.max_rounds = max_rounds  # 最大轮次限制
 
+    def analyze_next_steps(self, remaining_plan: List[Dict]) -> bool:
+        """
+        分析剩余计划中是否还有检索任务
+
+        Args:
+            remaining_plan: 剩余的执行计划
+
+        Returns:
+            如果剩余计划中只有LLM生成任务而没有检索任务，则返回True
+        """
+        has_retrieval = False
+        for step in remaining_plan:
+            for sub_step in step.get('sub_steps', []):
+                if sub_step.get('action') == 'retrieval':
+                    has_retrieval = True
+                    break
+            if has_retrieval:
+                break
+        return not has_retrieval  # 如果没有检索任务，返回True
+
     def generate_execution_plan(self, query: str) -> List[Dict]:
         """
         生成执行计划
@@ -317,7 +337,7 @@ class TaskExecutionSystem:
             content = response['choices'][0]['message']['content']
 
             if self.debug:
-                print(f"[DEBUG] 生成执行计划的输出: {content[:500]}...")
+                print(f"[DEBUG] 生成执行计划的输出: {content[:]}")
 
             # 提取JSON部分
             start_idx = content.find('{')
@@ -567,17 +587,19 @@ class TaskExecutionSystem:
 
         return all_indices, retrieval_indices, generation_indices
 
-    def execute_task(self, query: str) -> Dict:
+    def execute_task(self, query: str, mode: str = 'train') -> Dict:
         """
         执行完整任务
 
         Args:
             query: 用户的查询或任务
+            mode: 执行模式，'train' 或 'infer'
 
         Returns:
             任务执行结果
         """
         print(f"开始执行任务: {query}")
+        print(f"执行模式: {mode}")
         print(f"最大执行轮次限制: {self.max_rounds}")
 
         # 重置引用链
@@ -604,6 +626,7 @@ class TaskExecutionSystem:
         all_relevant_indices = []  # 存储所有步骤的相关索引
         all_retrieval_contents = []  # 存储所有检索内容
         reached_max_rounds = False  # 标记是否达到最大轮次
+        early_termination = False  # 标记是否提前终止
 
         for i, step in enumerate(execution_plan):
             # 检查是否超出最大轮次
@@ -641,6 +664,49 @@ class TaskExecutionSystem:
             all_relevant_indices.extend(step_result.get('relevant_indices', []))
             all_retrieval_contents.extend(step_result.get('retrieval_contents', []))
 
+            # 推理模式下的提前终止检查
+            if mode == 'infer':
+                remaining_plan = execution_plan[i+1:]  # 剩余计划
+                if len(remaining_plan) > 0:  # 如果还有剩余步骤
+                    # 检查当前步骤是否只有LLM生成任务
+                    current_has_only_gen = True
+                    for sub_step in step.get('sub_steps', []):
+                        if sub_step.get('action') == 'retrieval':
+                            current_has_only_gen = False
+                            break
+
+                    # 如果当前步骤只有生成任务，且后续没有检索任务，则提前终止
+                    if current_has_only_gen and self.analyze_next_steps(remaining_plan):
+                        print(f"\n🔍 推理模式检测到当前步骤后只有LLM生成任务，无检索任务，提前终止执行")
+                        early_termination = True
+
+                        # 生成当前结果的引用信息
+                        print("\n正在生成当前结果的引用信息...")
+                        final_answer, relevant_indices = self.generate_final_answer_and_relevant_indices(query, all_results)
+
+                        # 获取当前的引用序号信息
+                        all_indices, retrieval_indices, generation_indices = self.get_current_citation_indices()
+
+                        return {
+                            'status': 'success',
+                            'execution_plan': execution_plan,
+                            'all_results': all_results,
+                            'final_answer': final_answer,
+                            'relevant_indices': relevant_indices,  # 由大模型识别的相关索引
+                            'all_retrieval_contents': all_retrieval_contents,  # 包含所有检索内容
+                            'citation_chain': self.citation_chain,  # 包含完整的引用链
+                            'max_rounds': self.max_rounds,  # 返回最大轮次配置
+                            'executed_rounds': len(all_results),  # 返回实际执行的轮次
+                            'reached_max_rounds': reached_max_rounds,  # 是否达到最大轮次
+                            'early_termination': early_termination,  # 是否提前终止
+                            'current_citation_indices': {  # 当前保留的引用序号信息
+                                'all_indices': all_indices,
+                                'retrieval_indices': retrieval_indices,
+                                'generation_indices': generation_indices
+                            },
+                            'message': f'推理模式提前终止，已完成 {len(all_results)} 轮'
+                        }
+
         # 3. 生成最终答案及相关的索引
         print("\n正在生成最终答案和相关索引...")
         final_answer, relevant_indices = self.generate_final_answer_and_relevant_indices(query, all_results)
@@ -659,6 +725,7 @@ class TaskExecutionSystem:
             'max_rounds': self.max_rounds,  # 返回最大轮次配置
             'executed_rounds': len(all_results),  # 返回实际执行的轮次
             'reached_max_rounds': reached_max_rounds,  # 是否达到最大轮次
+            'early_termination': early_termination,  # 是否提前终止
             'current_citation_indices': {  # 当前保留的引用序号信息
                 'all_indices': all_indices,
                 'retrieval_indices': retrieval_indices,
@@ -788,6 +855,24 @@ class TaskExecutionSystem:
 
 # ------------------- 使用示例 -------------------
 if __name__ == "__main__":
+    # 从命令行参数获取模型和查询
+    parser = argparse.ArgumentParser(
+        description="这是一个任务规划脚步",
+        epilog="使用示例：python task_with_generation_and_query.py -q complex_query"
+    )
+    parser.add_argument("query",
+                        help="user's query")
+    parser.add_argument("--mode", "-m", default="infer",
+                        help="infer or train")
+    #max_rounds
+    parser.add_argument("--max_rounds", "-r", default=2,
+                        help="max rounds")
+    args = parser.parse_args()
+
+    user_query = args.query
+    mode = args.mode
+    max_rounds=int(args.max_rounds)
+
     # LLM配置
     LLM_CONFIGS = {
         "deepseek-v3": {
@@ -817,17 +902,16 @@ if __name__ == "__main__":
     kbp_client = KbpRetrievalClient()
 
     # 创建任务执行系统，指定最大轮次为5（可根据需要调整）
-    task_system = TaskExecutionSystem(llm_client, kbp_client, debug=True, max_rounds=5)
-
-    # 示例查询
-    user_query = sys.argv[1] if len(sys.argv) > 1 else "请告诉我海信的历史"
+    task_system = TaskExecutionSystem(llm_client, kbp_client, debug=True, max_rounds=max_rounds)
 
     # 执行任务
-    result = task_system.execute_task(user_query)
+    result = task_system.execute_task(user_query, mode=mode)
 
     print("\n" + "="*80)
     print("任务执行完成！")
     print("="*80)
+    print(f"原始查询: {user_query}")
+
     print(f"最终答案:\n{result['final_answer']}")
 
     # 打印轮次相关信息
@@ -835,6 +919,7 @@ if __name__ == "__main__":
     print(f"  最大轮次限制: {result.get('max_rounds', 'N/A')}")
     print(f"  实际执行轮次: {result.get('executed_rounds', 'N/A')}")
     print(f"  是否达到最大轮次: {'是' if result.get('reached_max_rounds', False) else '否'}")
+    print(f"  是否提前终止: {'是' if result.get('early_termination', False) else '否'}")
     print(f"  执行状态: {result['message']}")
 
     # 打印当前保留的引用序号信息
