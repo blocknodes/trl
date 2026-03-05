@@ -142,8 +142,7 @@ class SimpleLLMClient:
             "model": self.llm_configs[llm_name]["model"],
             "messages": messages,
             "temperature": temperature,
-            "n": n,
-            **kwargs
+            "n": n,** kwargs
         }
 
     def chat_completion(self, messages: List[Dict[str, str]], llm_name: Optional[str] = None,
@@ -169,7 +168,7 @@ class SimpleLLMClient:
         if llm_name not in self.llm_configs:
             raise ValueError(f"未知的LLM模型: {llm_name}")
 
-        payload = self._create_payload(llm_name, messages, temperature, n, **kwargs)
+        payload = self._create_payload(llm_name, messages, temperature, n,** kwargs)
         request_url, headers = self._prepare_request_parameters(llm_name)
 
         if debug:
@@ -230,11 +229,21 @@ class TaskExecutionSystem:
     任务执行系统，支持多步骤、多子步骤的任务执行
     """
 
-    def __init__(self, llm_client: SimpleLLMClient, kbp_client: KbpRetrievalClient, debug: bool = True):
+    def __init__(self, llm_client: SimpleLLMClient, kbp_client: KbpRetrievalClient, debug: bool = True, max_rounds: int = 10):
+        """
+        初始化任务执行系统
+
+        Args:
+            llm_client: LLM客户端实例
+            kbp_client: KBP检索客户端实例
+            debug: 是否开启调试模式
+            max_rounds: 最大执行轮次（步骤数）限制，默认10
+        """
         self.llm_client = llm_client
         self.kbp_client = kbp_client
         self.debug = debug
         self.citation_chain = {}  # 存储引用链
+        self.max_rounds = max_rounds  # 最大轮次限制
 
     def generate_execution_plan(self, query: str) -> List[Dict]:
         """
@@ -261,6 +270,7 @@ class TaskExecutionSystem:
         """
         plan_prompt = f"""
         请为以下任务生成详细的执行计划，计划应该分为多个步骤，每个步骤内可以有多个并行的子步骤。
+        注意：步骤总数**不能超过{self.max_rounds}个**，请合理规划步骤数量。
 
         任务: {query}
 
@@ -289,6 +299,7 @@ class TaskExecutionSystem:
         3. 每个子步骤都有明确的action类型和参数
         4. action类型包括：retrieval(信息检索), generation(LLM生成)
         5. 在后续步骤的query中，可以用 {{prev_step_result}} 占位符来表示上一步的结果
+        6. 步骤总数必须控制在{self.max_rounds}个以内
         """
 
         messages = [{"role": "user", "content": plan_prompt}]
@@ -313,7 +324,14 @@ class TaskExecutionSystem:
             end_idx = content.rfind('}') + 1
             json_str = content[start_idx:end_idx]
             plan_data = json.loads(json_str)
-            return plan_data.get('steps', [])
+            steps = plan_data.get('steps', [])
+
+            # 强制截断超出最大轮次的步骤
+            if len(steps) > self.max_rounds:
+                print(f"警告：生成的执行计划包含 {len(steps)} 个步骤，超过最大轮次限制 {self.max_rounds}，已自动截断")
+                steps = steps[:self.max_rounds]
+
+            return steps
         except Exception as e:
             print(f"解析执行计划失败: {e}")
             print(f"原始内容: {content}")
@@ -524,6 +542,31 @@ class TaskExecutionSystem:
             'summary': f"步骤 {step['step_id']} 完成，共执行了 {len(sub_steps)} 个子步骤"
         }
 
+    def get_current_citation_indices(self) -> Tuple[List[int], List[int], List[int]]:
+        """
+        获取当前保留的所有引用序号
+
+        Returns:
+            - 所有引用序号列表（包含检索和生成）
+            - 仅检索类型的引用序号列表
+            - 仅生成类型的引用序号列表
+        """
+        # 所有引用序号
+        all_indices = sorted(list(self.citation_chain.keys()))
+
+        # 区分检索和生成类型的引用
+        retrieval_indices = []
+        generation_indices = []
+
+        for idx in all_indices:
+            citation_type = self.citation_chain[idx].get('type', '')
+            if citation_type == 'retrieval':
+                retrieval_indices.append(idx)
+            elif citation_type == 'generation':
+                generation_indices.append(idx)
+
+        return all_indices, retrieval_indices, generation_indices
+
     def execute_task(self, query: str) -> Dict:
         """
         执行完整任务
@@ -535,6 +578,7 @@ class TaskExecutionSystem:
             任务执行结果
         """
         print(f"开始执行任务: {query}")
+        print(f"最大执行轮次限制: {self.max_rounds}")
 
         # 重置引用链
         self.citation_chain = {}
@@ -550,7 +594,7 @@ class TaskExecutionSystem:
                 'final_answer': '抱歉，无法处理您的请求'
             }
 
-        print(f"生成了 {len(execution_plan)} 个步骤的执行计划")
+        print(f"生成了 {len(execution_plan)} 个步骤的执行计划（最大限制 {self.max_rounds} 个）")
 
         # 2. 按步骤执行
         prev_step_result = None
@@ -559,8 +603,30 @@ class TaskExecutionSystem:
         all_results = {}
         all_relevant_indices = []  # 存储所有步骤的相关索引
         all_retrieval_contents = []  # 存储所有检索内容
+        reached_max_rounds = False  # 标记是否达到最大轮次
 
         for i, step in enumerate(execution_plan):
+            # 检查是否超出最大轮次
+            if i + 1 > self.max_rounds:
+                reached_max_rounds = True
+                print(f"\n⚠️  已达到最大执行轮次限制 ({self.max_rounds})，终止执行")
+
+                # 获取并输出当前保留的所有引用序号
+                all_indices, retrieval_indices, generation_indices = self.get_current_citation_indices()
+                print(f"\n📋 截止到最大轮次保留的引用序号信息:")
+                print(f"   - 所有引用序号: {all_indices}")
+                print(f"   - 检索类型引用序号: {retrieval_indices}")
+                print(f"   - 生成类型引用序号: {generation_indices}")
+
+                # 输出检索类型引用的具体内容
+                if retrieval_indices:
+                    print(f"\n📄 截止到最大轮次的检索结果详情:")
+                    for idx in retrieval_indices:
+                        citation_info = self.citation_chain[idx]
+                        print(f"   [{idx}] {citation_info['content'][:200]}...")
+
+                break
+
             step_result = self.execute_step(step, prev_step_result, prev_citations, prev_action_type)
             all_results[step['step_id']] = step_result
 
@@ -579,6 +645,9 @@ class TaskExecutionSystem:
         print("\n正在生成最终答案和相关索引...")
         final_answer, relevant_indices = self.generate_final_answer_and_relevant_indices(query, all_results)
 
+        # 获取最终的引用序号信息
+        all_indices, retrieval_indices, generation_indices = self.get_current_citation_indices()
+
         return {
             'status': 'success',
             'execution_plan': execution_plan,
@@ -587,7 +656,16 @@ class TaskExecutionSystem:
             'relevant_indices': relevant_indices,  # 由大模型识别的相关索引
             'all_retrieval_contents': all_retrieval_contents,  # 包含所有检索内容
             'citation_chain': self.citation_chain,  # 包含完整的引用链
-            'message': '任务执行完成'
+            'max_rounds': self.max_rounds,  # 返回最大轮次配置
+            'executed_rounds': len(all_results),  # 返回实际执行的轮次
+            'reached_max_rounds': reached_max_rounds,  # 是否达到最大轮次
+            'current_citation_indices': {  # 当前保留的引用序号信息
+                'all_indices': all_indices,
+                'retrieval_indices': retrieval_indices,
+                'generation_indices': generation_indices
+            },
+            'message': '任务执行完成' if len(all_results) <= self.max_rounds and not reached_max_rounds
+                       else f'任务执行终止（已达到最大轮次限制 {self.max_rounds}）'
         }
 
     def generate_final_answer_and_relevant_indices(self, original_query: str, all_results: Dict) -> Tuple[str, List[int]]:
@@ -738,8 +816,8 @@ if __name__ == "__main__":
     llm_client = SimpleLLMClient(llm_configs=LLM_CONFIGS, default_llm="qwen3-4b")
     kbp_client = KbpRetrievalClient()
 
-    # 创建任务执行系统
-    task_system = TaskExecutionSystem(llm_client, kbp_client, debug=True)
+    # 创建任务执行系统，指定最大轮次为5（可根据需要调整）
+    task_system = TaskExecutionSystem(llm_client, kbp_client, debug=True, max_rounds=5)
 
     # 示例查询
     user_query = sys.argv[1] if len(sys.argv) > 1 else "请告诉我海信的历史"
@@ -747,28 +825,43 @@ if __name__ == "__main__":
     # 执行任务
     result = task_system.execute_task(user_query)
 
-    print("\n" + "="*50)
+    print("\n" + "="*80)
     print("任务执行完成！")
-    print("="*50)
+    print("="*80)
     print(f"最终答案:\n{result['final_answer']}")
 
-    # 打印执行计划
-    print("\n执行计划详情:")
+    # 打印轮次相关信息
+    print(f"\n📊 执行轮次信息:")
+    print(f"  最大轮次限制: {result.get('max_rounds', 'N/A')}")
+    print(f"  实际执行轮次: {result.get('executed_rounds', 'N/A')}")
+    print(f"  是否达到最大轮次: {'是' if result.get('reached_max_rounds', False) else '否'}")
+    print(f"  执行状态: {result['message']}")
+
+    # 打印当前保留的引用序号信息
+    print(f"\n🔖 保留的引用序号信息:")
+    citation_indices = result.get('current_citation_indices', {})
+    print(f"  所有引用序号: {citation_indices.get('all_indices', [])}")
+    print(f"  检索类型引用序号: {citation_indices.get('retrieval_indices', [])}")
+    print(f"  生成类型引用序号: {citation_indices.get('generation_indices', [])}")
+
+    # 打印执行计划详情
+    print("\n📋 执行计划详情:")
     for step in result['execution_plan']:
         print(f"  步骤 {step['step_id']}: {step['description']}")
         for sub_step in step['sub_steps']:
             print(f"    - 子步骤 {sub_step['sub_step_id']}: {sub_step['action']}, 参数: {sub_step.get('parameters', {})}")
 
-    # 打印由大模型生成的相关检索结果的序号
-    print(f"\n大模型识别的相关检索条目序号: {result.get('relevant_indices', [])}")
+
 
     # 打印所有检索结果及其索引
-    print(f"\n\n\n\n\n所有检索结果:")
+    print(f"\n📄 所有检索结果:")
     for item in result.get('all_retrieval_contents', []):
-        print(f"[{item['index']}] {item['content']}")
+        print(f"  [{item['index']}] {item['content']}")
 
     # 打印完整的引用链
-    print(f"\n\n\n\n\n完整的引用链:")
+    print(f"\n🔗 完整的引用链:")
     for idx in sorted(result.get('citation_chain', {}).keys()):
         citation_info = result['citation_chain'][idx]
-        print(f"[{idx}] {citation_info['content'][:200]}... [类型: {citation_info['type']}, 来源: {citation_info.get('source', 'Unknown')}, 使用引用: {citation_info.get('used_citations', [])}]")
+        print(f"  [{idx}] {citation_info['content'][:200]}... [类型: {citation_info['type']}, 来源: {citation_info.get('source', 'Unknown')}, 使用引用: {citation_info.get('used_citations', [])}]")
+    # 打印由大模型生成的相关检索结果的序号
+    print(f"\n🎯 大模型识别的相关检索条目序号: {result.get('relevant_indices', [])}")
