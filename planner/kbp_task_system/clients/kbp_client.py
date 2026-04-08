@@ -3,7 +3,6 @@ import json
 import time
 import random
 from typing import List, Dict, Optional
-from mysql.connector import Error
 
 class KbpRetrievalClient:
     """
@@ -27,9 +26,9 @@ class KbpRetrievalClient:
             'api-key': self.api_key
         })
 
-    def retrieval(self, query: str, top_k: int = 5, score_threshold: int = 0, 
+    def retrieval(self, query: str, top_k: int = 5, score_threshold: int = 0,
                  search_mode: str = 'hybrid', tracing_model: bool = False,
-                 max_retries: int = 10, initial_delay: float = 0.5, 
+                 max_retries: int = 10, initial_delay: float = 0.5,
                  backoff_factor: float = 2.0) -> Optional[List[Dict]]:
         """
         执行检索请求（带退火重试机制）
@@ -57,10 +56,8 @@ class KbpRetrievalClient:
 
                 retrieval_results = []
                 for idx, item in enumerate(records):
-                    retrieval_results.append({
-                        'content': item['content'],
-                        'index': idx + 1
-                    })
+                    item['index'] = idx + 1
+                    retrieval_results.append(item)
 
                 return retrieval_results
             except requests.exceptions.RequestException as e:

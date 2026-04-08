@@ -69,6 +69,8 @@ class TaskExecutionSystem:
         4. action类型包括：retrieval(信息检索), generation(LLM生成)
         5. 在后续步骤的query中，可以用 {{prev_step_result}} 占位符来表示上一步的结果
         6. 步骤总数必须控制在{self.max_rounds}个以内
+        7. 同一步骤内只能是一种action type
+        8. 只在必要时做generation(LLM生成)，且尽量简洁
         """
 
         messages = [{"role": "user", "content": plan_prompt}]
@@ -108,7 +110,8 @@ class TaskExecutionSystem:
 
     def execute_sub_step(self, sub_step: Dict, prev_step_result: Optional[str] = None,
                          prev_citations: Optional[List[int]] = None,
-                         prev_action_type: Optional[str] = None) -> Dict:
+                         prev_action_type: Optional[str] = None,
+                         round_number: Optional[int] = None) -> Dict:
         """
         执行单个子步骤
         """
@@ -143,7 +146,9 @@ class TaskExecutionSystem:
                     'type': 'retrieval',
                     'content': item['content'],
                     'original_index': item['index'],
-                    'source': f"检索结果[{item['index']}]"
+                    'source': f"检索结果[{item['index']}]",
+                    'round_number': round_number,  # 添加轮次信息
+                    'orig_item':item
                 }
                 item['global_index'] = global_index
                 global_indices.append(global_index)
@@ -162,7 +167,7 @@ class TaskExecutionSystem:
 
             # 如果上一步是检索，则强制要求引用其中的部分条目
             if prev_action_type == 'retrieval' and prev_citations:
-                context_parts.append("您必须从以下检索结果中引用相关条目来回答问题:")
+                context_parts.append("您必须从以下检索结果中引用相关条目来回答问题，注意尽量简洁:")
                 for citation_idx in prev_citations:
                     if citation_idx in self.citation_chain:
                         citation_info = self.citation_chain[citation_idx]
@@ -207,7 +212,8 @@ class TaskExecutionSystem:
                 'content': content,
                 'source': f"LLM生成结果",
                 'parent_citations': prev_citations or [],
-                'used_citations': used_citations  # 实际使用的引用
+                'used_citations': used_citations,  # 实际使用的引用
+                'round_number': round_number  # 添加轮次信息
             }
 
             if self.debug:
@@ -230,7 +236,8 @@ class TaskExecutionSystem:
 
     def execute_step(self, step: Dict, prev_step_result: Optional[str] = None,
                      prev_citations: Optional[List[int]] = None,
-                     prev_action_type: Optional[str] = None) -> Dict:
+                     prev_action_type: Optional[str] = None,
+                     round_number: Optional[int] = None) -> Dict:
         """
         执行单个步骤（包含多个子步骤）
         """
@@ -246,7 +253,7 @@ class TaskExecutionSystem:
             print(f"  执行子步骤 {sub_step['sub_step_id']}: {sub_step['action']}")
 
             # 执行子步骤
-            result = self.execute_sub_step(sub_step, prev_step_result, prev_citations, prev_action_type)
+            result = self.execute_sub_step(sub_step, prev_step_result, prev_citations, prev_action_type, round_number)
             step_results[str(sub_step['sub_step_id'])] = result
 
             print(f"    - {result['message']}")
@@ -290,7 +297,8 @@ class TaskExecutionSystem:
             'citations': sorted(list(set(all_step_citations))),  # 当前步骤的引用列表
             'used_citations': sorted(list(set(all_used_citations))),  # 实际使用的引用列表
             'action_type': 'generation' if any('generation' in str(res.get('data', '')) for res in step_results.values()) else 'retrieval',
-            'summary': f"步骤 {step['step_id']} 完成，共执行了 {len(sub_steps)} 个子步骤"
+            'summary': f"步骤 {step['step_id']} 完成，共执行了 {len(sub_steps)} 个子步骤",
+            'round_number': round_number  # 添加轮次信息
         }
 
     def get_current_citation_indices(self) -> Tuple[List[int], List[int], List[int]]:
@@ -312,6 +320,38 @@ class TaskExecutionSystem:
                 generation_indices.append(idx)
 
         return all_indices, retrieval_indices, generation_indices
+
+    def trace_used_citations_backwards(self, starting_citation_ids: List[int]) -> List[int]:
+        """
+        从给定的引用ID开始，回溯到所有相关的retrieval节点
+        """
+        visited = set()
+        result_indices = set()
+
+        def dfs(citation_id):
+            if citation_id in visited:
+                return
+            visited.add(citation_id)
+
+            if citation_id not in self.citation_chain:
+                return
+
+            citation_info = self.citation_chain[citation_id]
+
+            # 如果是检索类型，加入结果
+            if citation_info.get('type') == 'retrieval':
+                result_indices.add(citation_id)
+                return  # 到达叶子节点，停止回溯
+
+            # 如果是生成类型，继续回溯其使用的引用
+            used_citations = citation_info.get('used_citations', [])
+            for used_id in used_citations:
+                dfs(used_id)
+
+        for start_id in starting_citation_ids:
+            dfs(start_id)
+
+        return sorted(list(result_indices))
 
     def execute_task(self, query: str, mode: str = 'train') -> Dict:
         """
@@ -352,6 +392,9 @@ class TaskExecutionSystem:
         early_termination = False  # 标记是否提前终止
 
         for i, step in enumerate(execution_plan):
+            # 记录当前轮次
+            current_round = i + 1
+
             # 检查是否超出最大轮次
             if i + 1 > self.max_rounds:
                 reached_max_rounds = True
@@ -373,7 +416,7 @@ class TaskExecutionSystem:
 
                 break
 
-            step_result = self.execute_step(step, prev_step_result, prev_citations, prev_action_type)
+            step_result = self.execute_step(step, prev_step_result, prev_citations, prev_action_type, current_round)
             all_results[step['step_id']] = step_result
 
             print(f"  {step_result['summary']}")
@@ -403,9 +446,39 @@ class TaskExecutionSystem:
                         print(f"\n🔍 推理模式检测到当前步骤后只有LLM生成任务，无检索任务，提前终止执行")
                         early_termination = True
 
+                        # 获取最后一轮的引用ID
+                        last_round_number = max(all_results.keys()) if all_results else 0
+                        last_round_result = all_results.get(last_round_number, {})
+
+                        # 从最后一轮的引用链中找到所有generation节点
+                        last_generation_citation_ids = []
+                        for citation_id, citation_info in self.citation_chain.items():
+                            if citation_info.get('type') == 'generation' and citation_info.get('round_number') == last_round_number:
+                                last_generation_citation_ids.append(citation_id)
+
+                        # 对最后一轮的每个generation节点进行回溯
+                        true_retrieved_indices = []
+                        if last_generation_citation_ids:
+                            for gen_citation_id in last_generation_citation_ids:
+                                citation_info = self.citation_chain[gen_citation_id]
+                                starting_citations = citation_info.get('used_citations', [])
+
+                                if starting_citations:
+                                    # 对每个generation节点的引用进行回溯
+                                    retrieved_for_this_gen = self.trace_used_citations_backwards(starting_citations)
+                                    true_retrieved_indices.extend(retrieved_for_this_gen)
+
+                        # 去重
+                        true_retrieved_indices = sorted(list(set(true_retrieved_indices)))
+
+                        # 如果没有任何回溯到的检索片段，查找所有检索类型的节点
+                        if not true_retrieved_indices:
+                            _, retrieval_indices, _ = self.get_current_citation_indices()
+                            true_retrieved_indices = retrieval_indices
+
                         # 生成当前结果的引用信息
                         print("\n正在生成当前结果的引用信息...")
-                        final_answer, relevant_indices = self.generate_final_answer_and_relevant_indices(query, all_results)
+                        final_answer, relevant_indices = self.generate_final_answer_and_relevant_indices(query, all_results, true_retrieved_indices, use_llm=False)
 
                         # 获取当前的引用序号信息
                         all_indices, retrieval_indices, generation_indices = self.get_current_citation_indices()
@@ -421,6 +494,7 @@ class TaskExecutionSystem:
                             'final_answer': final_answer,
                             'last_round_result': last_round_result,
                             'relevant_indices': relevant_indices,
+                            'true_retrieved_indices': true_retrieved_indices,  # 新增：真实引用的检索片段索引
                             'all_citations': self.citation_chain,
                             'execution_info': {
                                 'max_rounds': self.max_rounds,
@@ -438,7 +512,38 @@ class TaskExecutionSystem:
 
         # 3. 生成最终答案及相关的索引
         print("\n正在生成最终答案和相关索引...")
-        final_answer, relevant_indices = self.generate_final_answer_and_relevant_indices(query, all_results)
+
+        # 获取最后一轮的引用ID
+        last_round_number = max(all_results.keys()) if all_results else 0
+        last_round_result = all_results.get(last_round_number, {})
+
+        # 从最后一轮的引用链中找到所有generation节点
+        last_generation_citation_ids = []
+        for citation_id, citation_info in self.citation_chain.items():
+            if citation_info.get('type') == 'generation' and citation_info.get('round_number') == last_round_number:
+                last_generation_citation_ids.append(citation_id)
+
+        # 对最后一轮的每个generation节点进行回溯
+        true_retrieved_indices = []
+        if last_generation_citation_ids:
+            for gen_citation_id in last_generation_citation_ids:
+                citation_info = self.citation_chain[gen_citation_id]
+                starting_citations = citation_info.get('used_citations', [])
+
+                if starting_citations:
+                    # 对每个generation节点的引用进行回溯
+                    retrieved_for_this_gen = self.trace_used_citations_backwards(starting_citations)
+                    true_retrieved_indices.extend(retrieved_for_this_gen)
+
+        # 去重
+        true_retrieved_indices = sorted(list(set(true_retrieved_indices)))
+
+        # 如果没有任何回溯到的检索片段，查找所有检索类型的节点
+        if not true_retrieved_indices:
+            _, retrieval_indices, _ = self.get_current_citation_indices()
+            true_retrieved_indices = retrieval_indices
+
+        final_answer, relevant_indices = self.generate_final_answer_and_relevant_indices(query, all_results, true_retrieved_indices)
 
         # 获取最终的引用序号信息
         all_indices, retrieval_indices, generation_indices = self.get_current_citation_indices()
@@ -454,6 +559,7 @@ class TaskExecutionSystem:
             'final_answer': final_answer,
             'last_round_result': last_round_result,
             'relevant_indices': relevant_indices,
+            'true_retrieved_indices': true_retrieved_indices,  # 新增：真实引用的检索片段索引
             'all_citations': self.citation_chain,
             'execution_info': {
                 'max_rounds': self.max_rounds,
@@ -470,10 +576,30 @@ class TaskExecutionSystem:
                        else f'任务执行终止（已达到最大轮次限制 {self.max_rounds}）'
         }
 
-    def generate_final_answer_and_relevant_indices(self, original_query: str, all_results: Dict) -> Tuple[str, List[int]]:
+    def generate_final_answer_and_relevant_indices(self, original_query: str, all_results: Dict, true_retrieved_indices: List[int] = None, use_llm: bool = True) -> Tuple[str, List[int]]:
         """
-        根据所有步骤结果生成最终答案，并让大模型识别最相关的检索结果索引
+        根据所有步骤结果生成最终答案，并返回最相关的检索结果索引
+        :param original_query: 原始查询
+        :param all_results: 所有步骤结果
+        :param true_retrieved_indices: 真实引用的检索片段索引（由回溯算法得出）
+        :param use_llm: 是否调用LLM生成（infer模式最后一轮设为False）
+        :return: 最终答案, 相关索引列表
         """
+        # ===== 新增：infer模式跳过LLM，直接基于引用链生成 =====
+        if not use_llm:
+            # 1. 提取所有检索类型的引用索引（即relevant_indices）
+            _, retrieval_indices, _ = self.get_current_citation_indices()
+            relevant_indices = retrieval_indices
+
+            # 2. 拼接所有相关检索内容作为最终答案
+            final_answer_parts = [f"以下是与「{original_query}」相关的检索内容："]
+            for idx in relevant_indices:
+                citation_info = self.citation_chain[idx]
+                final_answer_parts.append(f"[{idx}] {citation_info['content']}")
+
+            final_answer = "\n".join(final_answer_parts)
+            return final_answer, relevant_indices
+        # ===== 原有LLM调用逻辑（保留）=====
         # 构建上下文
         context_parts = []
         all_contents = []
@@ -507,13 +633,24 @@ class TaskExecutionSystem:
             source_info = citation_info.get('source', 'Unknown')
             parent_citations = citation_info.get('parent_citations', [])
             used_citations = citation_info.get('used_citations', [])
+            round_number = citation_info.get('round_number', 'Unknown')
             parent_refs = f" (来自引用: {parent_citations})" if parent_citations else ""
             used_refs = f" (使用了引用: {used_citations})" if used_citations else ""
-            citation_context += f"[{idx}] {citation_info['content']} [来源: {source_info}{parent_refs}{used_refs}]\n\n"
+            round_info = f" (第{round_number}轮)" if round_number != 'Unknown' else ""
+            citation_context += f"[{idx}] {citation_info['content']} [来源: {source_info}{parent_refs}{used_refs}{round_info}]\n\n"
 
-        final_prompt = f"""
-        基于以下任务执行结果，为原始查询生成最终答案，并在答案中适当位置引用相关信息源的编号。
-        同时，请分析并列出最相关的检索结果索引。
+        # 构建最终提示
+        if true_retrieved_indices:
+            # 如果提供了真实引用的检索片段索引，强调这些内容
+            true_retrieved_context = "真实引用的检索片段:\n"
+            for idx in true_retrieved_indices:
+                if idx in self.citation_chain:
+                    citation_info = self.citation_chain[idx]
+                    true_retrieved_context += f"[{idx}] {citation_info['content']}\n\n"
+
+            final_prompt = f"""
+            基于以下任务执行结果，为原始查询生成最终答案，并在答案中适当位置引用相关信息源的编号。
+            同时，请分析并列出最相关的检索结果索引。
 
         原始查询: {original_query}
 
