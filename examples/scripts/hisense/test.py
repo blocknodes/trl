@@ -112,11 +112,17 @@ def query_length_reward_func(completions, **kwargs):
 training_args = GRPOConfig(
     output_dir="./grpo_results",
     logging_steps=1,
+    use_vllm=True,
+    vllm_mode="server",
+    log_completions=True,
+    save_strategy="steps",    # 按步数保存
+    save_steps=20,
+    #lens_negative_alpha=0.25
 )
 
 trainer = GRPOTrainer(
     model="../../../../../models/Qwen3-4B-Instruct-2507/",
-    reward_funcs=[format_reward_func, query_count_reward_func, query_length_reward_func],
+    reward_funcs=[format_reward_func, query_count_reward_func],
     train_dataset=dataset,
     args=training_args,
 )
