@@ -144,27 +144,96 @@ def _parse_llm_json(content: str) -> dict | None:
     return None
 
 
-def _collect_all_results_from_history(history: dict | None) -> dict:
-    """从 history 中收集所有检索结果，按工具类型分组去重，用于 final 输出。"""
+def _collect_all_results_from_history(history: dict | None, original_query: str = "", top_k: int = 3) -> dict:
+    """从 history 中组装 final 结果，按工具类型分组。
+
+    组装规则:
+    1. 按 sub_query 分组，每个 sub_query 内按 score 降序排列
+    2. 原始 query 对应的那路放第一位
+    3. 每路至少入围 1 条结果
+    4. 轮询取结果直到凑够 top_k，跳过已选过的重复记录
+    """
     if not history:
         return {}
-    results_by_tool: dict[str, list[dict]] = {}
-    seen: dict[str, set] = {}
+
+    # 按 (sub_query, tool_type) 收集结果，每路内部按 score 降序
+    # streams[tool_type] = [(sub_query, [record, ...]), ...]
+    streams_by_tool: dict[str, dict[str, list[dict]]] = {}
+
     for turn_key in sorted(history.keys()):
         turn_data = history[turn_key]
         contents = turn_data.get("retrieval_contents", [])
         for item in contents:
+            sq = item.get("sub_query", "")
             result = item.get("result", {})
             for tool_type, records in result.items():
-                if tool_type not in results_by_tool:
-                    results_by_tool[tool_type] = []
-                    seen[tool_type] = set()
-                for record in records:
-                    key = (record.get("title", ""), record.get("content", "")[:100])
-                    if key not in seen[tool_type]:
-                        seen[tool_type].add(key)
-                        results_by_tool[tool_type].append(record)
-    return results_by_tool
+                if tool_type not in streams_by_tool:
+                    streams_by_tool[tool_type] = {}
+                if sq not in streams_by_tool[tool_type]:
+                    streams_by_tool[tool_type][sq] = []
+                streams_by_tool[tool_type][sq].extend(records)
+
+    # 每路内部按 score 降序排列
+    for tool_type in streams_by_tool:
+        for sq in streams_by_tool[tool_type]:
+            streams_by_tool[tool_type][sq].sort(
+                key=lambda r: r.get("score", 0) if isinstance(r.get("score", 0), (int, float)) else 0,
+                reverse=True,
+            )
+
+    final: dict[str, list[dict]] = {}
+
+    for tool_type, sq_map in streams_by_tool.items():
+        # 排序 sub_query 列表：原始 query 放第一位，其余保持插入顺序
+        sq_keys = list(sq_map.keys())
+        if original_query in sq_keys:
+            sq_keys.remove(original_query)
+            sq_keys.insert(0, original_query)
+
+        # 构建每路的候选流（带指针）
+        streams: list[tuple[str, list[dict]]] = [(sq, sq_map[sq]) for sq in sq_keys]
+
+        selected: list[dict] = []
+        seen: set[tuple] = set()
+        pointers = [0] * len(streams)  # 每路当前取到的位置
+
+        def _record_key(record: dict) -> str:
+            return record.get("content", "")
+
+        def _pick_next(stream_idx: int) -> dict | None:
+            """从指定路中取下一个不重复的记录。"""
+            sq, records = streams[stream_idx]
+            while pointers[stream_idx] < len(records):
+                r = records[pointers[stream_idx]]
+                pointers[stream_idx] += 1
+                if _record_key(r) not in seen:
+                    return r
+            return None
+
+        # 第一轮：每路至少取 1 条，保证每路入围
+        for i in range(len(streams)):
+            r = _pick_next(i)
+            if r is not None:
+                seen.add(_record_key(r))
+                selected.append(r)
+
+        # 后续轮：轮询取，直到凑够 top_k
+        while len(selected) < top_k:
+            added = False
+            for i in range(len(streams)):
+                if len(selected) >= top_k:
+                    break
+                r = _pick_next(i)
+                if r is not None:
+                    seen.add(_record_key(r))
+                    selected.append(r)
+                    added = True
+            if not added:
+                break  # 所有路都取完了
+
+        final[tool_type] = selected
+
+    return final
 
 
 def _get_sub_queries_with_used_tools(history: dict | None) -> list[dict]:
@@ -325,7 +394,7 @@ async def planner(req: PlanningRequest):
 
         # 停止条件: 达到 max_turn / 所有 sub_query 的工具都已用完
         if not current_items:
-            final = _collect_all_results_from_history(req.history)
+            final = _collect_all_results_from_history(req.history, original_query=req.query, top_k=req.retrieval_setting.top_k)
             logger.info("Turn %d | stop, final has %d tool types", req.turn, len(final))
             return _respond(PlanningResponse(
                 is_off_topic=False,

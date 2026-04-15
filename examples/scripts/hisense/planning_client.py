@@ -45,7 +45,7 @@ _web_search_backend: str = "xiaosu"  # "bocha" or "xiaosu"
 
 # ── 工具实现 ────────────────────────────────────────────────────
 
-async def kbp_search(query: str, top_k: int = 10) -> list[dict]:
+async def kbp_search(query: str, top_k: int = 10, search_strategy: str = "broad") -> list[dict]:
     """调用海信 KBP 检索 API，返回结构化结果列表。"""
     payload = {
         "query": query,
@@ -53,7 +53,7 @@ async def kbp_search(query: str, top_k: int = 10) -> list[dict]:
             "top_k": top_k,
             "score_threshold": 0,
             "search_mode": "hybrid",
-            "search_strategy": "broad",
+            "search_strategy": search_strategy,
         },
         "tracingModel": False,
     }
@@ -81,11 +81,16 @@ async def kbp_search(query: str, top_k: int = 10) -> list[dict]:
                     results = []
                     for item in records:
                         results.append({
-                            "file_name": item.get("metadata", {}).get("source", ""),
+                            "score": item.get("score", 0),
+                            "from_query": item.get("from_query", ""),
                             "title": item.get("title", item.get("metadata", {}).get("title", "")),
                             "content": item.get("content", item.get("text", item.get("segment", "")))[:500],
-                            "score": item.get("score", 0),
-                            "category_path": item.get("metadata", {}).get("category_path", ""),
+                            "file_name": item.get("file_name", item.get("metadata", {}).get("source", "")),
+                            "category_path": item.get("category_path", item.get("metadata", {}).get("category_path", "")),
+                            "category_type": item.get("category_type", ""),
+                            "knowledge_id": item.get("knowledge_id", ""),
+                            "url": item.get("url", ""),
+                            "metadata": item.get("metadata", {}),
                         })
                     return results
             except asyncio.TimeoutError:
@@ -208,7 +213,7 @@ async def web_search(query: str, topk: int = 10) -> list[dict]:
     return await bocha_web_search(query, count=topk)
 
 
-async def execute_search(sub_query: str, tool_use: str, topk: int) -> dict:
+async def execute_search(sub_query: str, tool_use: str, topk: int, search_strategy: str = "broad") -> dict:
     """对一个 sub_query 执行指定工具的搜索，返回 planning 协议格式的结果。"""
     tools = [t.strip() for t in tool_use.split(",") if t.strip()]
     result: dict[str, list[dict]] = {}
@@ -217,7 +222,7 @@ async def execute_search(sub_query: str, tool_use: str, topk: int) -> dict:
     tool_names = []
     for tool in tools:
         if tool == "es":
-            tasks.append(kbp_search(sub_query, top_k=topk))
+            tasks.append(kbp_search(sub_query, top_k=topk, search_strategy=search_strategy))
             tool_names.append("es")
         elif tool == "web":
             tasks.append(web_search(sub_query, topk=topk))
@@ -243,7 +248,8 @@ async def execute_search(sub_query: str, tool_use: str, topk: int) -> dict:
 
 async def run(server_url: str, question: str, max_turn: int, top_k: int,
               score_threshold: float, max_top_k: int, tool_hub: str,
-              tool_hub_optional: str, debug: bool = False):
+              tool_hub_optional: str, search_strategy: str = "broad",
+              debug: bool = False):
     """循环调用 planning_server /planner，执行搜索，直到 status="stop"。"""
     logger.info("Server: %s", server_url)
     logger.info("Question: %s", question)
@@ -311,7 +317,8 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
                 logger.info("  sub_query=%r tools=%s topk=%d", item["sub_query"], item["tool_use"], item["topk"])
 
             # 并发执行所有 sub_query 的搜索
-            tasks = [execute_search(item["sub_query"], item["tool_use"], item["topk"]) for item in current]
+            tasks = [execute_search(item["sub_query"], item["tool_use"], item["topk"],
+                                    search_strategy=search_strategy) for item in current]
             retrieval_contents = await asyncio.gather(*tasks)
 
             # 打印搜索结果摘要
@@ -340,6 +347,8 @@ def main():
     parser.add_argument("--max-top-k", type=int, default=3, help="Max top_k per sub-query")
     parser.add_argument("--tool-hub", default="es,graph,web", help="Available tools")
     parser.add_argument("--tool-hub-optional", default="", help="Optional tools")
+    parser.add_argument("--search-strategy", default="broad", choices=["broad", "precise"],
+                        help="KBP search strategy: broad or precise (default: broad)")
     parser.add_argument("--debug", action="store_true", help="Print full retrieval results")
     parser.add_argument("--web-backend", default="xiaosu", choices=["bocha", "xiaosu"],
                         help="Web search backend: bocha or xiaosu (default: bocha)")
@@ -372,6 +381,7 @@ def main():
         max_top_k=args.max_top_k,
         tool_hub=args.tool_hub,
         tool_hub_optional=args.tool_hub_optional,
+        search_strategy=args.search_strategy,
         debug=args.debug,
     ))
 
