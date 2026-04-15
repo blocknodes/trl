@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 
 import aiohttp
@@ -32,12 +33,12 @@ KBP_API_KEY = "a5198155-607d-4e4b-b92c-f04259964c93"
 
 # ── Bocha Web Search API 配置 ───────────────────────────────────
 BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
-BOCHA_API_KEY = "sk-2ad764f6f07041ee99eca00816403d2b"
+BOCHA_API_KEY = os.environ.get("BOCHA_API_KEY", "")
 
 # ── 小素 (Xiaosu) Web Search API 配置 ──────────────────────────
 XIAOSU_API_URL = "https://inner-apisix.hisense.com/hiagent/v1/chat-messages"
 XIAOSU_USER_KEY = "bt5ix3u9szdexwlvpmsxcavl3hnnyytf"
-XIAOSU_API_KEY = "app-YPgOiXUZm9fFIb2RksDCRoiS"
+XIAOSU_API_KEY = "app-idmVXotvzndcnkqPn9OajqRn"
 
 # 运行时由 main() 设置
 _web_search_backend: str = "xiaosu"  # "bocha" or "xiaosu"
@@ -249,7 +250,7 @@ async def execute_search(sub_query: str, tool_use: str, topk: int, search_strate
 async def run(server_url: str, question: str, max_turn: int, top_k: int,
               score_threshold: float, max_top_k: int, tool_hub: str,
               tool_hub_optional: str, search_strategy: str = "broad",
-              debug: bool = False):
+              deep_thinking: bool = False, debug: bool = False):
     """循环调用 planning_server /planner，执行搜索，直到 status="stop"。"""
     logger.info("Server: %s", server_url)
     logger.info("Question: %s", question)
@@ -277,6 +278,7 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
                 "max_context_size": 3,
                 "tool_hub": tool_hub,
                 "tool_hub_optional": tool_hub_optional,
+                "deep_thinking": deep_thinking,
             }
             if history:
                 payload["history"] = history
@@ -305,11 +307,23 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
 
             if status == "stop":
                 logger.info("Planning complete")
+                # deep_thinking 模式额外输出
+                answer = resp_data.get("answer")
+                ref_tree = resp_data.get("reference_tree")
+                if answer:
+                    logger.info("Answer:\n%s", answer)
+                if ref_tree:
+                    logger.info("Reference tree:\n%s", json.dumps(ref_tree, ensure_ascii=False, indent=2))
                 if final:
                     logger.info("Final results:\n%s", json.dumps(final, ensure_ascii=False, indent=2))
-                else:
+                elif not answer:
                     logger.info("No results")
                 return
+
+            # deep_thinking 模式打印中间步骤总结
+            step_summary = resp_data.get("step_summary")
+            if step_summary:
+                logger.info("Step summary: %s", step_summary)
 
             # status == "running"，执行搜索
             logger.info("Sub-queries to search: %d", len(current))
@@ -349,6 +363,8 @@ def main():
     parser.add_argument("--tool-hub-optional", default="", help="Optional tools")
     parser.add_argument("--search-strategy", default="broad", choices=["broad", "precise"],
                         help="KBP search strategy: broad or precise (default: broad)")
+    parser.add_argument("--deep-thinking", action="store_true",
+                        help="Enable deep thinking mode (multi-step research with planning)")
     parser.add_argument("--debug", action="store_true", help="Print full retrieval results")
     parser.add_argument("--web-backend", default="xiaosu", choices=["bocha", "xiaosu"],
                         help="Web search backend: bocha or xiaosu (default: bocha)")
@@ -382,6 +398,7 @@ def main():
         tool_hub=args.tool_hub,
         tool_hub_optional=args.tool_hub_optional,
         search_strategy=args.search_strategy,
+        deep_thinking=args.deep_thinking,
         debug=args.debug,
     ))
 

@@ -14,9 +14,11 @@ Planning Server: FastAPI 服务，实现两轮 planning 协议。
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import re
+import time
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -74,6 +76,76 @@ app = FastAPI(title="Planning Server")
 
 _llm_client: AsyncOpenAI | None = None
 _llm_model: str = ""
+_planner_client: AsyncOpenAI | None = None
+_planner_model: str = ""
+
+
+# ── Deep Thinking: session 存储和 prompts ───────────────────────
+
+# session_id -> {"plan": [...], "summaries": [...], "step_idx": int, "query": str, "created_at": float}
+_deep_sessions: dict[str, dict] = {}
+_session_ttl: int = 600  # 默认 10 分钟，可通过 --session-ttl 配置
+
+
+def _make_session_id(query: str) -> str:
+    """根据 query 生成确定性的 session_id。"""
+    return hashlib.md5(query.encode("utf-8")).hexdigest()
+
+
+def _cleanup_expired_sessions():
+    """清理超时的 session。"""
+    now = time.time()
+    expired = [sid for sid, s in _deep_sessions.items() if now - s.get("created_at", 0) > _session_ttl]
+    for sid in expired:
+        logger.info("Session expired, cleaning up: %s", sid)
+        _deep_sessions.pop(sid, None)
+
+DEEP_PLAN_PROMPT = """\
+You are a research planning assistant. Given a user query and a maximum number of steps, \
+create a step-by-step research plan. Each step should specify what to search for and why.
+
+Rules:
+1. Each step has a clear search goal.
+2. Later steps can build on information gathered in earlier steps.
+3. Total steps must NOT exceed max_steps.
+4. If the query is simple, fewer steps are fine.
+5. Each step should have a "goal" (what to find) and "reason" (why this is needed).
+
+You MUST respond with a JSON object:
+{"steps": [{"goal": "...", "reason": "..."}, ...]}
+
+If the query is casual chat:
+{"steps": []}
+"""
+
+DEEP_SUMMARY_PROMPT = """\
+You are a research assistant. Given a search query, search results, and previous research context, \
+provide a concise summary of the findings and list the key references.
+
+Previous context:
+%s
+
+Current step goal: %s
+
+Search results:
+%s
+
+Respond with a JSON object:
+{"summary": "concise summary of findings", "references": [{"title": "...", "content_snippet": "...", "source": "...", "query": "the sub_query that produced this result"}], "key_facts": ["fact1", "fact2"]}
+"""
+
+DEEP_FINAL_PROMPT = """\
+You are a research assistant. Given all the research summaries collected across multiple steps, \
+synthesize a final comprehensive answer to the original question.
+
+Original question: %s
+
+Research summaries:
+%s
+
+Respond with a JSON object:
+{"answer": "comprehensive final answer", "reference_tree": [{"step": 1, "goal": "...", "summary": "...", "references": [...]}]}
+"""
 
 
 # ── Request / Response Models ───────────────────────────────────
@@ -101,6 +173,7 @@ class PlanningRequest(BaseModel):
     tool_hub: str = "es,graph,web"
     tool_hub_optional: str = ""
     history: dict | None = None
+    deep_thinking: bool = False
 
 
 class PlanningResponse(BaseModel):
@@ -110,6 +183,10 @@ class PlanningResponse(BaseModel):
     current: list[SubQueryItem] | None = None
     history: dict | None = None
     final: dict | None = None
+    # deep_thinking 模式额外字段
+    step_summary: str | None = None
+    answer: str | None = None
+    reference_tree: list | None = None
 
 
 # ── Helper functions ────────────────────────────────────────────
@@ -274,6 +351,296 @@ def _trim_history(history: dict | None, max_context_size: int) -> dict | None:
 
 # ── API Endpoint ────────────────────────────────────────────────
 
+async def _deep_create_plan(query: str, max_steps: int) -> list[dict]:
+    """调用 planner 模型生成研究计划。"""
+    messages = [
+        {"role": "system", "content": DEEP_PLAN_PROMPT},
+        {"role": "user", "content": f'query: "{query}"\nmax_steps: {max_steps}'},
+    ]
+    completion = await _planner_client.chat.completions.create(
+        model=_planner_model,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=2048,
+    )
+    content = completion.choices[0].message.content or ""
+    logger.log(VERBOSE, "Deep plan raw response:\n%s", content)
+    parsed = _parse_llm_json(content)
+    if parsed and "steps" in parsed:
+        return parsed["steps"]
+    return []
+
+
+async def _deep_rewrite_query(goal: str, context: str, key_facts: list[str], max_top_k: int) -> list[str]:
+    """将 step goal 结合前面轮次的搜索结果具体化，再调用 query_rewriter 分解为 sub_queries。
+
+    关键：KBP 没有记忆，所以 goal 中任何依赖前面轮次的引用（如"在价格和匹数范围内"、
+    "初始结果中"、"上述型号"等）都必须替换为具体的数值、型号名、参数等，
+    生成的 query 必须是完全自包含的，可以直接丢给搜索引擎。
+    """
+    resolved_goal = goal
+
+    # 如果有前面轮次的 context 或 key_facts，先让 planner 模型把 goal 具体化
+    if context or key_facts:
+        facts_text = "\n".join(f"- {f}" for f in key_facts)
+        resolve_prompt = (
+            "你的任务：将搜索目标改写为一个完全自包含的搜索 query。\n\n"
+            "规则（必须严格遵守）：\n"
+            "1. 搜索引擎没有任何记忆，不知道之前搜过什么，所以输出的 query 必须包含所有必要信息。\n"
+            "2. 禁止出现任何模糊引用，包括但不限于：'初始结果'、'上述'、'前面提到的'、"
+            "'符合条件的'、'在...范围内'（不带具体数值）、'相关型号'等。\n"
+            "3. 所有引用必须替换为具体的数值、型号名、品牌名、参数值。\n"
+            "4. 如果已知事实中没有对应的具体值，则删除该限定条件，不要用模糊表述代替。\n"
+            "5. 只输出改写后的 query 文本，不要解释、不要加引号。\n\n"
+            f"已知事实（来自前面的搜索结果）:\n{facts_text}\n\n"
+            f"前面的研究摘要:\n{context}\n\n"
+            f"原始搜索目标: {goal}\n\n"
+            "改写后的搜索 query:"
+        )
+        completion = await _planner_client.chat.completions.create(
+            model=_planner_model,
+            messages=[{"role": "user", "content": resolve_prompt}],
+            temperature=0.1,
+            max_tokens=512,
+        )
+        resolved = (completion.choices[0].message.content or "").strip()
+        resolved = re.sub(r"<think>.*?</think>", "", resolved, flags=re.DOTALL).strip()
+        # 去掉可能的引号包裹
+        resolved = resolved.strip('"').strip("'").strip(""").strip(""")
+        if resolved:
+            logger.info("Deep thinking: resolved goal %r -> %r", goal, resolved)
+            resolved_goal = resolved
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f'query: "{resolved_goal}"\ntopk: {max_top_k}'},
+    ]
+    completion = await _llm_client.chat.completions.create(
+        model=_llm_model,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=2048,
+    )
+    content = completion.choices[0].message.content or ""
+    parsed = _parse_llm_json(content)
+    if parsed and "sub_queries" in parsed:
+        return parsed["sub_queries"]
+    return [goal]
+
+
+async def _deep_summarize(goal: str, results_text: str, prev_context: str) -> dict:
+    """调用 planner 模型对搜索结果做总结。"""
+    prompt = DEEP_SUMMARY_PROMPT % (prev_context or "(无)", goal, results_text[:4000])
+    messages = [
+        {"role": "system", "content": "You are a research assistant."},
+        {"role": "user", "content": prompt},
+    ]
+    completion = await _planner_client.chat.completions.create(
+        model=_planner_model,
+        messages=messages,
+        temperature=0.3,
+        max_tokens=2048,
+    )
+    content = completion.choices[0].message.content or ""
+    logger.log(VERBOSE, "Deep summary raw response:\n%s", content)
+    parsed = _parse_llm_json(content)
+    if parsed:
+        return parsed
+    return {"summary": content[:500], "references": [], "key_facts": []}
+
+
+async def _deep_final_answer(query: str, all_summaries: list[dict]) -> dict:
+    """调用 planner 模型生成最终答案和引用树。"""
+    summaries_text = json.dumps(all_summaries, ensure_ascii=False, indent=2)
+    prompt = DEEP_FINAL_PROMPT % (query, summaries_text[:6000])
+    messages = [
+        {"role": "system", "content": "You are a research assistant."},
+        {"role": "user", "content": prompt},
+    ]
+    completion = await _planner_client.chat.completions.create(
+        model=_planner_model,
+        messages=messages,
+        temperature=0.3,
+        max_tokens=4096,
+    )
+    content = completion.choices[0].message.content or ""
+    logger.log(VERBOSE, "Deep final answer raw response:\n%s", content)
+    parsed = _parse_llm_json(content)
+    if parsed:
+        return parsed
+    return {"answer": content[:2000], "reference_tree": []}
+
+
+def _results_to_text(history_turn: dict) -> str:
+    """将一轮检索结果转为文本摘要供 LLM 使用。"""
+    lines = []
+    for item in history_turn.get("retrieval_contents", []):
+        sq = item.get("sub_query", "")
+        for tool_type, records in item.get("result", {}).items():
+            for r in records[:5]:
+                title = r.get("title", "")
+                content = r.get("content", "")[:300]
+                score = r.get("score", "")
+                lines.append(f"[{tool_type}] query={sq} | title={title} | score={score}\n{content}")
+    return "\n---\n".join(lines) if lines else "(无结果)"
+
+
+def _collect_referenced_records(summaries: list[dict]) -> dict:
+    """从 deep_thinking 各步骤的 summaries 中提取被引用的 records，按步骤组织。
+
+    每个 summary 中的 references 列表即为该步骤引用的记录，
+    返回 {"step_1": [...], "step_2": [...]} 格式，去重。
+    """
+    result: dict[str, list[dict]] = {}
+    seen: set[str] = set()
+    for s in summaries:
+        step_key = f"step_{s.get('step', 0)}"
+        refs = s.get("references", [])
+        deduped = []
+        for ref in refs:
+            key = ref.get("content_snippet", ref.get("title", ""))
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(ref)
+        if deduped:
+            result[step_key] = deduped
+    return result
+
+async def _handle_deep_thinking(req: PlanningRequest) -> PlanningResponse:
+    """Deep thinking 模式处理。
+
+    Turn 1: 调用 planner 模型生成研究计划，然后对第一步做 query rewrite，返回搜索任务
+    Turn 2+: 接收上一步搜索结果，调用 planner 模型做总结，然后对下一步做 query rewrite
+    最后一步或所有步骤完成: 生成最终 answer + reference_tree
+    """
+    # 清理过期 session
+    _cleanup_expired_sessions()
+
+    session_id = _make_session_id(req.query)
+
+    if req.turn == 1:
+        # ── 首轮: 生成 plan，执行第一步 ──
+        logger.info("Deep thinking Turn 1 | query=%r, session_id=%s", req.query, session_id)
+        steps = await _deep_create_plan(req.query, max_steps=req.max_turn)
+
+        if not steps:
+            logger.info("Deep thinking: off-topic or empty plan")
+            return PlanningResponse(is_off_topic=True, status="stop", turn=req.turn, current=[])
+
+        logger.info("Deep thinking plan: %d steps", len(steps))
+        for i, s in enumerate(steps):
+            logger.info("  Step %d: %s", i + 1, s.get("goal", ""))
+
+        # 创建 session（如果已存在则覆盖）
+        _deep_sessions[session_id] = {
+            "plan": steps,
+            "summaries": [],
+            "step_idx": 0,
+            "query": req.query,
+            "created_at": time.time(),
+        }
+
+        # 对第一步做 query rewrite
+        step = steps[0]
+        sub_queries = await _deep_rewrite_query(step["goal"], "", [], req.max_top_k)
+        # deep_thinking 模式下每步有自己的 goal，不插入最初的 query
+
+        logger.info("Deep thinking Step 1 | sub_queries=%s", sub_queries)
+
+        current_items = [SubQueryItem(sub_query=sq, tool_use=req.tool_hub, topk=req.max_top_k) for sq in sub_queries]
+
+        return PlanningResponse(
+            is_off_topic=False,
+            status="running",
+            turn=req.turn,
+            current=current_items,
+        )
+
+    else:
+        # ── 后续轮: 总结上一步结果，执行下一步或结束 ──
+        if session_id not in _deep_sessions:
+            logger.warning("Deep thinking: session not found: %s", session_id)
+            return PlanningResponse(status="stop", turn=req.turn, final={})
+
+        session = _deep_sessions[session_id]
+        plan = session["plan"]
+        step_idx = session["step_idx"]
+        query = session["query"]
+
+        # 总结上一步的搜索结果
+        prev_context = "\n".join(
+            f"Step {i + 1}: {s.get('summary', '')}" for i, s in enumerate(session["summaries"])
+        )
+        latest_turn_key = f"turn_{req.turn - 1}"
+        results_text = ""
+        if req.history and latest_turn_key in req.history:
+            results_text = _results_to_text(req.history[latest_turn_key])
+
+        current_step = plan[step_idx]
+        logger.info("Deep thinking Turn %d | summarizing step %d: %s",
+                     req.turn, step_idx + 1, current_step.get("goal", ""))
+
+        summary_result = await _deep_summarize(current_step["goal"], results_text, prev_context)
+        session["summaries"].append({
+            "step": step_idx + 1,
+            "goal": current_step.get("goal", ""),
+            "reason": current_step.get("reason", ""),
+            **summary_result,
+        })
+        session["step_idx"] = step_idx + 1
+
+        logger.info("Deep thinking Step %d summary: %s",
+                     step_idx + 1, summary_result.get("summary", "")[:200])
+
+        # 检查是否还有下一步
+        next_idx = step_idx + 1
+        if next_idx >= len(plan) or req.turn >= req.max_turn:
+            # ── 所有步骤完成或达到 max_turn: 生成最终答案 ──
+            logger.info("Deep thinking: generating final answer (%d summaries)", len(session["summaries"]))
+            final_result = await _deep_final_answer(query, session["summaries"])
+
+            # final 只放各步骤 summaries 中引用到的 records，不放全量
+            final = _collect_referenced_records(session["summaries"])
+
+            # 清理 session
+            _deep_sessions.pop(session_id, None)
+
+            return PlanningResponse(
+                is_off_topic=False,
+                status="stop",
+                turn=req.turn,
+                final=final,
+                step_summary=summary_result.get("summary", ""),
+                answer=final_result.get("answer", ""),
+                reference_tree=final_result.get("reference_tree", []),
+                history=_trim_history(req.history, req.max_context_size),
+            )
+
+        # ── 还有下一步: 用之前的总结作为 context，对下一步做 query rewrite ──
+        next_step = plan[next_idx]
+        accumulated_context = "\n".join(
+            f"Step {s['step']}: {s.get('summary', '')}" for s in session["summaries"]
+        )
+        # 收集所有步骤的 key_facts，供 goal 具体化使用
+        all_key_facts = []
+        for s in session["summaries"]:
+            all_key_facts.extend(s.get("key_facts", []))
+
+        sub_queries = await _deep_rewrite_query(next_step["goal"], accumulated_context, all_key_facts, req.max_top_k)
+        logger.info("Deep thinking Step %d | sub_queries=%s", next_idx + 1, sub_queries)
+
+        current_items = [SubQueryItem(sub_query=sq, tool_use=req.tool_hub, topk=req.max_top_k) for sq in sub_queries]
+
+        return PlanningResponse(
+            is_off_topic=False,
+            status="running",
+            turn=req.turn,
+            current=current_items,
+            step_summary=summary_result.get("summary", ""),
+            history=_trim_history(req.history, req.max_context_size),
+        )
+
+
 @app.post("/planner", response_model=PlanningResponse)
 async def planner(req: PlanningRequest):
     """单一 planning 端点。
@@ -291,6 +658,10 @@ async def planner(req: PlanningRequest):
         logger.debug("Response summary: status=%s, turn=%d, current=%d items",
                       resp.status, resp.turn, len(resp.current) if resp.current else 0)
         return resp
+
+    # ── Deep Thinking 模式 ──────────────────────────────────────
+    if req.deep_thinking:
+        return await _handle_deep_thinking(req)
 
     if req.turn == 1:
         # ── 首轮: 调用 LLM 做 query rewrite，得到 sub_queries ──
@@ -424,6 +795,12 @@ def main():
     parser.add_argument("--port", type=int, default=9100)
     parser.add_argument("--base-url", default="http://localhost:8078/v1", help="vLLM server base URL")
     parser.add_argument("--model", default="qwen4b", help="Model name")
+    parser.add_argument("--planner-base-url", default=None,
+                        help="Planner LLM base URL for deep_thinking (defaults to --base-url)")
+    parser.add_argument("--planner-model", default=None,
+                        help="Planner model name for deep_thinking (defaults to --model)")
+    parser.add_argument("--session-ttl", type=int, default=600,
+                        help="Deep thinking session TTL in seconds (default: 600)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["VERBOSE", "DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Console logging level (default: INFO)")
@@ -441,9 +818,13 @@ def main():
     _fh.setLevel(VERBOSE if args.file_log_level == "VERBOSE" else getattr(logging, args.file_log_level))
     logging.basicConfig(level=VERBOSE, format=_log_fmt, handlers=[_fh, _console])
 
-    global _llm_client, _llm_model
+    global _llm_client, _llm_model, _planner_client, _planner_model, _session_ttl
     _llm_client = AsyncOpenAI(base_url=args.base_url, api_key="EMPTY")
     _llm_model = args.model
+    _planner_base_url = args.planner_base_url or args.base_url
+    _planner_model = args.planner_model or args.model
+    _planner_client = AsyncOpenAI(base_url=_planner_base_url, api_key="EMPTY")
+    _session_ttl = args.session_ttl
 
     uvicorn.run(app, host=args.host, port=args.port)
 
