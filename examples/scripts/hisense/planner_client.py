@@ -182,13 +182,13 @@ async def bocha_web_search(query: str, count: int = 50) -> str:
     return f"[Bocha Search] All retries failed for query: '{query}'"
 
 
-async def real_tool_result(tool_name: str, tool_args: dict) -> str:
-    """调用真实 API 获取搜索结果。和 planner.py 完全一致。"""
+async def real_tool_result(tool_name: str, tool_args: dict, top_k: int = 10) -> str:
+    """调用真实 API 获取搜索结果。"""
     if tool_name == "inner_search":
         queries = tool_args.get("query", [])
         if isinstance(queries, str):
             queries = [queries]
-        tasks = [kbp_search(q) for q in queries]
+        tasks = [kbp_search(q, top_k=top_k) for q in queries]
         responses = await asyncio.gather(*tasks)
         return "\n=======\n".join(responses)
     elif tool_name == "web_search":
@@ -204,7 +204,7 @@ async def real_tool_result(tool_name: str, tool_args: dict) -> str:
 
 # ── 主循环：调用 server，执行工具，回传结果 ─────────────────────
 
-async def run(server_url: str, question: str, max_turns: int, debug: bool = False):
+async def run(server_url: str, question: str, max_turns: int, top_k: int = 10, debug: bool = False):
     """循环调用 planner_server，执行工具，直到得到 answer 或 chat。"""
     print("=" * 70)
     print(f"Server: {server_url}")
@@ -228,7 +228,7 @@ async def run(server_url: str, question: str, max_turns: int, debug: bool = Fals
                 print(f"{'─' * 50}")
 
                 # 2. 调用 server /step
-                step_payload = {"session_id": session_id}
+                step_payload = {"session_id": session_id, "max_turns": max_turns, "top_k": top_k}
                 if tool_response is not None:
                     step_payload["tool_response"] = tool_response
 
@@ -254,6 +254,10 @@ async def run(server_url: str, question: str, max_turns: int, debug: bool = Fals
                 if status == "answer":
                     print(f"\n{'=' * 70}")
                     print(f"Agent finished with answer:\n{step_data.get('answer', '')}")
+                    merged = step_data.get("merged_results", {})
+                    if merged:
+                        print(f"\n[Merged results by tool type]:")
+                        print(json.dumps(merged, ensure_ascii=False, indent=2))
                     print(f"{'=' * 70}")
                     return
 
@@ -268,7 +272,7 @@ async def run(server_url: str, question: str, max_turns: int, debug: bool = Fals
                         print(f"[Tool args]: {json.dumps(tool_args, ensure_ascii=False, indent=2)}")
 
                     # 并发执行所有 tool calls
-                    tasks = [real_tool_result(tc["name"], tc["arguments"]) for tc in tool_calls]
+                    tasks = [real_tool_result(tc["name"], tc["arguments"], top_k=top_k) for tc in tool_calls]
                     results = await asyncio.gather(*tasks)
 
                     for tc, result in zip(tool_calls, results):
@@ -303,10 +307,11 @@ def main():
     parser.add_argument("--server-url", default="http://localhost:9000", help="Planner server URL")
     parser.add_argument("--question", default="海信冰箱", help="Test question")
     parser.add_argument("--max-turns", type=int, default=5, help="Max conversation turns")
+    parser.add_argument("--top-k", type=int, default=10, help="Top-k for inner KB (KBP) retrieval")
     parser.add_argument("--debug", action="store_true", help="Print full tool responses without truncation")
     args = parser.parse_args()
 
-    asyncio.run(run(args.server_url, args.question, args.max_turns, args.debug))
+    asyncio.run(run(args.server_url, args.question, args.max_turns, top_k=args.top_k, debug=args.debug))
 
 
 if __name__ == "__main__":
