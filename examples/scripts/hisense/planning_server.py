@@ -338,6 +338,22 @@ def _get_sub_queries_with_used_tools(history: dict | None) -> list[dict]:
     return [{"sub_query": sq, "topk": info["topk"], "used_tools": info["used_tools"]} for sq, info in agg.items()]
 
 
+def _count_total_qualified(history: dict | None, score_threshold: float) -> int:
+    """统计 history 中所有 tool 类型、所有 sub_query 达到 score_threshold 的结果总数。"""
+    count = 0
+    if not history:
+        return count
+    for turn_key in sorted(history.keys()):
+        turn_data = history[turn_key]
+        for item in turn_data.get("retrieval_contents", []):
+            for tool_type, records in item.get("result", {}).items():
+                for r in records:
+                    score = r.get("score", 0)
+                    if isinstance(score, (int, float)) and score >= score_threshold:
+                        count += 1
+    return count
+
+
 def _trim_history(history: dict | None, max_context_size: int) -> dict | None:
     """只保留最近 max_context_size 轮的 history。"""
     if not history:
@@ -651,12 +667,21 @@ async def planner(req: PlanningRequest):
     停止条件: 达到 max_turn / 所有 sub_query 达标 / 所有工具已用完
     """
     logger.log(VERBOSE, "Request input:\n%s", json.dumps(req.model_dump(), ensure_ascii=False, indent=2, default=str))
-    logger.debug("Request summary: turn=%d, query=%r, tool_hub=%s", req.turn, req.query, req.tool_hub)
+    logger.debug("Request summary: turn=%d, query=%r, tool_hub=%s, tool_hub_optional=%s, "
+                 "score_threshold=%.4f, top_k=%d, max_top_k=%d, deep_thinking=%s",
+                 req.turn, req.query, req.tool_hub, req.tool_hub_optional,
+                 req.retrieval_setting.score_threshold, req.retrieval_setting.top_k,
+                 req.max_top_k, req.deep_thinking)
 
     def _respond(resp: PlanningResponse) -> PlanningResponse:
         logger.log(VERBOSE, "Response output:\n%s", json.dumps(resp.model_dump(), ensure_ascii=False, indent=2, default=str))
-        logger.debug("Response summary: status=%s, turn=%d, current=%d items",
-                      resp.status, resp.turn, len(resp.current) if resp.current else 0)
+        current_summary = ""
+        if resp.current:
+            parts = [f"({c.sub_query} -> [{c.tool_use}] topk={c.topk})" for c in resp.current]
+            current_summary = ", ".join(parts)
+        final_tools = list(resp.final.keys()) if resp.final else []
+        logger.debug("Response summary: status=%s, turn=%d, current=[%s], final_tools=%s",
+                      resp.status, resp.turn, current_summary, final_tools)
         return resp
 
     # ── Deep Thinking 模式 ──────────────────────────────────────
@@ -729,44 +754,55 @@ async def planner(req: PlanningRequest):
         ))
 
     else:
-        # ── 非首轮: 纯规则，不调 LLM ──
+        # ── 非首轮: 纯规则，按阈值和 top_k 判断是否需要补搜 ──
         logger.info("Turn %d | rule-based, tool_hub=%s, tool_hub_optional=%s",
                      req.turn, req.tool_hub, req.tool_hub_optional)
 
-        # 所有可用工具 = tool_hub + tool_hub_optional
-        all_tools: set[str] = set()
-        for t in req.tool_hub.split(","):
-            t = t.strip()
-            if t:
-                all_tools.add(t)
+        score_threshold = req.retrieval_setting.score_threshold
+        top_k = req.retrieval_setting.top_k
+
+        # 统计所有 tool、所有 sub_query 达标结果的总数
+        total_qualified = _count_total_qualified(req.history, score_threshold)
+        logger.debug("Total qualified (threshold=%.4f): %d, top_k=%d", score_threshold, total_qualified, top_k)
+
+        # 总数凑满 top_k，直接结束
+        if total_qualified >= top_k:
+            final = _collect_all_results_from_history(req.history, original_query=req.query, top_k=top_k)
+            logger.info("Turn %d | total qualified=%d >= top_k=%d, stop. final has %d tool types",
+                        req.turn, total_qualified, top_k, len(final))
+            return _respond(PlanningResponse(
+                is_off_topic=False,
+                status="stop",
+                turn=req.turn,
+                final=final,
+                history=_trim_history(req.history, req.max_context_size),
+            ))
+
+        # 凑不满，用 tool_hub_optional 中尚未使用的工具对所有 sub_query 补搜
+        optional_tools: set[str] = set()
         if req.tool_hub_optional:
             for t in req.tool_hub_optional.split(","):
                 t = t.strip()
                 if t:
-                    all_tools.add(t)
+                    optional_tools.add(t)
 
-        # 收集所有 sub_query 及其已用工具
         all_items = _get_sub_queries_with_used_tools(req.history)
-        logger.debug("Sub-queries with used tools: %s",
-                      [(i["sub_query"], i["used_tools"]) for i in all_items])
-
-        # 对所有 sub_query，找出尚未使用的工具
         current_items = []
-        if req.turn < req.max_turn:
+        if req.turn < req.max_turn and optional_tools:
             for item in all_items:
-                remaining_tools = all_tools - item["used_tools"]
+                remaining_tools = optional_tools - item["used_tools"]
                 if remaining_tools:
-                    logger.debug("sub_query=%r remaining_tools=%s", item["sub_query"], remaining_tools)
+                    logger.debug("sub_query=%r optional remaining_tools=%s", item["sub_query"], remaining_tools)
                     current_items.append(SubQueryItem(
                         sub_query=item["sub_query"],
                         tool_use=",".join(sorted(remaining_tools)),
                         topk=min(item["topk"], req.max_top_k),
                     ))
 
-        # 停止条件: 达到 max_turn / 所有 sub_query 的工具都已用完
+        # 没有可补搜的任务，直接结束
         if not current_items:
-            final = _collect_all_results_from_history(req.history, original_query=req.query, top_k=req.retrieval_setting.top_k)
-            logger.info("Turn %d | stop, final has %d tool types", req.turn, len(final))
+            final = _collect_all_results_from_history(req.history, original_query=req.query, top_k=top_k)
+            logger.info("Turn %d | no optional tools to try, stop. final has %d tool types", req.turn, len(final))
             return _respond(PlanningResponse(
                 is_off_topic=False,
                 status="stop",
@@ -795,10 +831,12 @@ def main():
     parser.add_argument("--port", type=int, default=9100)
     parser.add_argument("--base-url", default="http://localhost:8078/v1", help="vLLM server base URL")
     parser.add_argument("--model", default="qwen4b", help="Model name")
-    parser.add_argument("--planner-base-url", default=None,
-                        help="Planner LLM base URL for deep_thinking (defaults to --base-url)")
-    parser.add_argument("--planner-model", default=None,
-                        help="Planner model name for deep_thinking (defaults to --model)")
+    parser.add_argument("--planner-base-url", default="https://aix-backup.hismarttv.com/v1",
+                        help="Planner LLM base URL for deep_thinking")
+    parser.add_argument("--planner-model", default="deepseek-v3",
+                        help="Planner model name for deep_thinking")
+    parser.add_argument("--planner-api-key", default="x31ctKZ0ONfi1jkO",
+                        help="Planner LLM API key")
     parser.add_argument("--session-ttl", type=int, default=600,
                         help="Deep thinking session TTL in seconds (default: 600)")
     parser.add_argument("--log-level", default="INFO",
@@ -821,9 +859,8 @@ def main():
     global _llm_client, _llm_model, _planner_client, _planner_model, _session_ttl
     _llm_client = AsyncOpenAI(base_url=args.base_url, api_key="EMPTY")
     _llm_model = args.model
-    _planner_base_url = args.planner_base_url or args.base_url
-    _planner_model = args.planner_model or args.model
-    _planner_client = AsyncOpenAI(base_url=_planner_base_url, api_key="EMPTY")
+    _planner_model = args.planner_model
+    _planner_client = AsyncOpenAI(base_url=args.planner_base_url, api_key=args.planner_api_key)
     _session_ttl = args.session_ttl
 
     uvicorn.run(app, host=args.host, port=args.port)

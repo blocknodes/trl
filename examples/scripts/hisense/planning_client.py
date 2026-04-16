@@ -284,15 +284,22 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
                 payload["history"] = history
 
             logger.log(VERBOSE, "Request payload:\n%s", json.dumps(payload, ensure_ascii=False, indent=2))
-            logger.debug("Request summary: turn=%d, query=%r, tool_hub=%s", turn, question, tool_hub)
+            logger.debug("Request summary: turn=%d, query=%r, tool_hub=%s, tool_hub_optional=%s, "
+                         "top_k=%d, score_threshold=%.4f, max_top_k=%d",
+                         turn, question, tool_hub, tool_hub_optional, top_k, score_threshold, max_top_k)
 
             async with http.post(f"{server_url}/planner", json=payload,
                                  timeout=aiohttp.ClientTimeout(total=120)) as resp:
                 resp_data = await resp.json()
 
             logger.log(VERBOSE, "Response data:\n%s", json.dumps(resp_data, ensure_ascii=False, indent=2))
-            logger.debug("Response summary: status=%s, current=%d items",
-                         resp_data.get("status"), len(resp_data.get("current") or []))
+            current_items = resp_data.get("current") or []
+            current_summary = ", ".join(
+                f"({c['sub_query']} -> [{c['tool_use']}] topk={c['topk']})" for c in current_items
+            )
+            final_tools = list((resp_data.get("final") or {}).keys())
+            logger.debug("Response summary: status=%s, current=[%s], final_tools=%s",
+                         resp_data.get("status"), current_summary, final_tools)
 
             status = resp_data.get("status", "stop")
             is_off_topic = resp_data.get("is_off_topic", False)
