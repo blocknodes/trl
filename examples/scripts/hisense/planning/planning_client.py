@@ -250,7 +250,7 @@ async def execute_search(sub_query: str, tool_use: str, topk: int, search_strate
 async def run(server_url: str, question: str, max_turn: int, top_k: int,
               score_threshold: float, max_top_k: int, tool_hub: str,
               tool_hub_optional: str, search_strategy: str = "broad",
-              deep_thinking: bool = False, debug: bool = False):
+              deep_thinking: bool = False, dynamic_thinking: bool = False, debug: bool = False):
     """循环调用 planning_server /planner，执行搜索，直到 status="stop"。"""
     logger.info("Server: %s", server_url)
     logger.info("Question: %s", question)
@@ -279,6 +279,7 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
                 "tool_hub": tool_hub,
                 "tool_hub_optional": tool_hub_optional,
                 "deep_thinking": deep_thinking,
+                "dynamic_thinking": dynamic_thinking,
             }
             if history:
                 payload["history"] = history
@@ -314,9 +315,12 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
 
             if status == "stop":
                 logger.info("Planning complete")
-                # deep_thinking 模式额外输出
+                # deep_thinking / dynamic_thinking 模式额外输出
                 answer = resp_data.get("answer")
                 ref_tree = resp_data.get("reference_tree")
+                step_summary = resp_data.get("step_summary")
+                if step_summary:
+                    logger.info("Final step summary: %s", step_summary)
                 if answer:
                     logger.info("Answer:\n%s", answer)
                 if ref_tree:
@@ -372,6 +376,8 @@ def main():
                         help="KBP search strategy: broad or precise (default: broad)")
     parser.add_argument("--deep-thinking", action="store_true",
                         help="Enable deep thinking mode (multi-step research with planning)")
+    parser.add_argument("--dynamic-thinking", action="store_true",
+                        help="Enable dynamic thinking mode (react-style: search then decide next step)")
     parser.add_argument("--debug", action="store_true", help="Print full retrieval results")
     parser.add_argument("--web-backend", default="xiaosu", choices=["bocha", "xiaosu"],
                         help="Web search backend: bocha or xiaosu (default: bocha)")
@@ -406,6 +412,7 @@ def main():
         tool_hub_optional=args.tool_hub_optional,
         search_strategy=args.search_strategy,
         deep_thinking=args.deep_thinking,
+        dynamic_thinking=args.dynamic_thinking,
         debug=args.debug,
     ))
 
