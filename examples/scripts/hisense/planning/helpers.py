@@ -39,6 +39,7 @@ class PlanningRequest(BaseModel):
     tool_hub_optional: str = ""
     history: dict | None = None
     thinking: str = "simple"  # "simple", "dynamic", "deep"
+    tool_select_enable: bool = False
     tool_selection_mode: str = "rule"  # "rule" or "model"
     tool_selection_threshold: float | None = None
 

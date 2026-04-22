@@ -4,7 +4,7 @@ import logging
 
 from openai import AsyncOpenAI
 
-from helpers import _parse_llm_json
+from helpers import VERBOSE, _parse_llm_json
 from prompts import GRAPH_TOOL_SELECTION_PROMPT
 
 logger = logging.getLogger("planning_server.tool_selection")
@@ -38,12 +38,12 @@ async def select_optional_tools(
         prompt = TOOL_SELECTION_PROMPTS[tool].replace("{query}", query)
         messages = [{"role": "user", "content": prompt}]
         try:
-            logger.debug("Tool selection [%s] query=%r, prompt length=%d", tool, query, len(prompt))
+            logger.log(VERBOSE, "Tool selection [%s] input prompt:\n%s", tool, prompt)
             completion = await client.chat.completions.create(
                 model=model, messages=messages, temperature=0, max_tokens=512,
             )
             content = completion.choices[0].message.content or ""
-            logger.debug("Tool selection [%s] raw response: %s", tool, content[:500])
+            logger.log(VERBOSE, "Tool selection [%s] output:\n%s", tool, content)
             parsed = _parse_llm_json(content)
             in_scope = parsed.get("in_scope", False) if parsed else False
             confidence = float(parsed.get("confidence_score", 0.0)) if parsed else 0.0

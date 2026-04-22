@@ -31,6 +31,8 @@ _llm_client: AsyncOpenAI | None = None
 _llm_model: str = ""
 _planner_client: AsyncOpenAI | None = None
 _planner_model: str = ""
+_ts_client: AsyncOpenAI | None = None
+_ts_model: str = ""
 _ts_threshold: float = 0
 
 
@@ -62,7 +64,7 @@ async def planner(req: PlanningRequest):
     if mode in ("deep", "dynamic"):
         resp = await handler(req, _llm_client, _llm_model, _planner_client, _planner_model, trim_history)
     else:
-        resp = await handler(req, _llm_client, _llm_model, _planner_client, _planner_model, _ts_threshold)
+        resp = await handler(req, _llm_client, _llm_model, _ts_client, _ts_model, _ts_threshold)
 
     logger.log(VERBOSE, "Response output:\n%s", json.dumps(resp.model_dump(), ensure_ascii=False, indent=2, default=str))
     current_summary = ""
@@ -91,6 +93,12 @@ def main():
                         help="Planner LLM API key")
     parser.add_argument("--session-ttl", type=int, default=600,
                         help="Deep thinking session TTL in seconds (default: 600)")
+    parser.add_argument("--tool-select-base-url", default="http://localhost:8071/v1",
+                        help="Tool selection LLM base URL (default: http://localhost:8071/v1)")
+    parser.add_argument("--tool-select-model", default="qwen4b",
+                        help="Tool selection model name (default: qwen4b)")
+    parser.add_argument("--tool-select-api-key", default="EMPTY",
+                        help="Tool selection LLM API key")
     parser.add_argument("--tool-selection-threshold", type=float, default=0,
                         help="Default threshold for model-based tool selection (default: 0)")
     parser.add_argument("--log-level", default="INFO",
@@ -110,11 +118,13 @@ def main():
     _fh.setLevel(VERBOSE if args.file_log_level == "VERBOSE" else getattr(logging, args.file_log_level))
     logging.basicConfig(level=VERBOSE, format=_log_fmt, handlers=[_fh, _console])
 
-    global _llm_client, _llm_model, _planner_client, _planner_model, _ts_threshold
+    global _llm_client, _llm_model, _planner_client, _planner_model, _ts_client, _ts_model, _ts_threshold
     _llm_client = AsyncOpenAI(base_url=args.base_url, api_key="EMPTY")
     _llm_model = args.model
     _planner_model = args.planner_model
     _planner_client = AsyncOpenAI(base_url=args.planner_base_url, api_key=args.planner_api_key)
+    _ts_client = AsyncOpenAI(base_url=args.tool_select_base_url, api_key=args.tool_select_api_key)
+    _ts_model = args.tool_select_model
     _ts_threshold = args.tool_selection_threshold
     try:
         from deep_thinking import set_session_ttl

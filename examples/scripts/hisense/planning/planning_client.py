@@ -216,21 +216,24 @@ async def web_search(query: str, topk: int = 10) -> list[dict]:
 
 async def execute_search(sub_query: str, tool_use: str, topk: int, search_strategy: str = "broad") -> dict:
     """对一个 sub_query 执行指定工具的搜索，返回 planning 协议格式的结果。"""
+    # struct/unstruct 是 graph/es 的别名
+    _alias = {"struct": "graph", "unstruct": "es"}
     tools = [t.strip() for t in tool_use.split(",") if t.strip()]
     result: dict[str, list[dict]] = {}
 
     tasks = []
     tool_names = []
     for tool in tools:
-        if tool == "es":
+        canonical = _alias.get(tool, tool)
+        if canonical == "es":
             tasks.append(kbp_search(sub_query, top_k=topk, search_strategy=search_strategy))
-            tool_names.append("es")
-        elif tool == "web":
+            tool_names.append(tool)  # 保留原始名
+        elif canonical == "web":
             tasks.append(web_search(sub_query, topk=topk))
-            tool_names.append("web")
-        elif tool == "graph":
+            tool_names.append(tool)
+        elif canonical == "graph":
             # graph 暂未实现，直接置空
-            result["graph"] = []
+            result[tool] = []
 
     if tasks:
         responses = await asyncio.gather(*tasks)
@@ -250,7 +253,8 @@ async def execute_search(sub_query: str, tool_use: str, topk: int, search_strate
 async def run(server_url: str, question: str, max_turn: int, top_k: int,
               score_threshold: float, max_top_k: int, tool_hub: str,
               tool_hub_optional: str, search_strategy: str = "broad",
-              thinking: str = "simple", debug: bool = False):
+              thinking: str = "simple", tool_select_enable: bool = False,
+              debug: bool = False):
     """循环调用 planning_server /planner，执行搜索，直到 status="stop"。"""
     logger.info("Server: %s", server_url)
     logger.info("Question: %s", question)
@@ -279,6 +283,7 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
                 "tool_hub": tool_hub,
                 "tool_hub_optional": tool_hub_optional,
                 "thinking": thinking,
+                "tool_select_enable": tool_select_enable,
             }
             if history:
                 payload["history"] = history
@@ -375,6 +380,8 @@ def main():
                         help="KBP search strategy: broad or precise (default: broad)")
     parser.add_argument("--thinking", default="simple", choices=["simple", "dynamic", "deep"],
                         help="Thinking mode: simple (default), dynamic (react-style), deep (multi-step research)")
+    parser.add_argument("--tool-select-enable", action="store_true",
+                        help="Enable model-based tool selection (graph vs es) for simple thinking")
     parser.add_argument("--debug", action="store_true", help="Print full retrieval results")
     parser.add_argument("--web-backend", default="xiaosu", choices=["bocha", "xiaosu"],
                         help="Web search backend: bocha or xiaosu (default: bocha)")
@@ -409,6 +416,7 @@ def main():
         tool_hub_optional=args.tool_hub_optional,
         search_strategy=args.search_strategy,
         thinking=args.thinking,
+        tool_select_enable=args.tool_select_enable,
         debug=args.debug,
     ))
 
