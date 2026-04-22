@@ -136,3 +136,17 @@ Respond with a JSON object:
 - If sufficient: {"status": "stop", "summary": "...", "key_facts": ["..."], "references": [...]}
 - If more search needed: {"status": "continue", "summary": "...", "key_facts": ["..."], "references": [...], "next_goal": "what to search next and why"}
 """
+
+# ── Tool Selection: Graph ───────────────────────────────────────
+
+GRAPH_TOOL_SELECTION_PROMPT = """\
+判断以下用户查询是否适合使用知识图谱(graph)工具进行检索。
+
+知识图谱适用于：实体关系查询、属性对比、型号参数查询、产品关联关系等结构化问题。
+知识图谱不适用于：闲聊、主观评价、操作指南、故障排查等非结构化问题。
+
+用户查询: {query}
+
+请用 JSON 格式回答:
+{"in_scope": true/false, "confidence_score": 0.0-1.0, "reason": "简要说明"}
+"""

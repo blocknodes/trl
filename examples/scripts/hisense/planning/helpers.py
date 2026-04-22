@@ -38,8 +38,9 @@ class PlanningRequest(BaseModel):
     tool_hub: str = "es,graph,web"
     tool_hub_optional: str = ""
     history: dict | None = None
-    deep_thinking: bool = False
-    dynamic_thinking: bool = False
+    thinking: str = "simple"  # "simple", "dynamic", "deep"
+    tool_selection_mode: str = "rule"  # "rule" or "model"
+    tool_selection_threshold: float | None = None
 
 
 class PlanningResponse(BaseModel):

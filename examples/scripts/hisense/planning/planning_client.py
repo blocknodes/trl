@@ -250,7 +250,7 @@ async def execute_search(sub_query: str, tool_use: str, topk: int, search_strate
 async def run(server_url: str, question: str, max_turn: int, top_k: int,
               score_threshold: float, max_top_k: int, tool_hub: str,
               tool_hub_optional: str, search_strategy: str = "broad",
-              deep_thinking: bool = False, dynamic_thinking: bool = False, debug: bool = False):
+              thinking: str = "simple", debug: bool = False):
     """循环调用 planning_server /planner，执行搜索，直到 status="stop"。"""
     logger.info("Server: %s", server_url)
     logger.info("Question: %s", question)
@@ -278,8 +278,7 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
                 "max_context_size": 3,
                 "tool_hub": tool_hub,
                 "tool_hub_optional": tool_hub_optional,
-                "deep_thinking": deep_thinking,
-                "dynamic_thinking": dynamic_thinking,
+                "thinking": thinking,
             }
             if history:
                 payload["history"] = history
@@ -374,10 +373,8 @@ def main():
     parser.add_argument("--tool-hub-optional", default="", help="Optional tools")
     parser.add_argument("--search-strategy", default="broad", choices=["broad", "precise"],
                         help="KBP search strategy: broad or precise (default: broad)")
-    parser.add_argument("--deep-thinking", action="store_true",
-                        help="Enable deep thinking mode (multi-step research with planning)")
-    parser.add_argument("--dynamic-thinking", action="store_true",
-                        help="Enable dynamic thinking mode (react-style: search then decide next step)")
+    parser.add_argument("--thinking", default="simple", choices=["simple", "dynamic", "deep"],
+                        help="Thinking mode: simple (default), dynamic (react-style), deep (multi-step research)")
     parser.add_argument("--debug", action="store_true", help="Print full retrieval results")
     parser.add_argument("--web-backend", default="xiaosu", choices=["bocha", "xiaosu"],
                         help="Web search backend: bocha or xiaosu (default: bocha)")
@@ -411,8 +408,7 @@ def main():
         tool_hub=args.tool_hub,
         tool_hub_optional=args.tool_hub_optional,
         search_strategy=args.search_strategy,
-        deep_thinking=args.deep_thinking,
-        dynamic_thinking=args.dynamic_thinking,
+        thinking=args.thinking,
         debug=args.debug,
     ))
 
