@@ -15,6 +15,12 @@ For example, "410和510有啥区别" should be decomposed into "410特点", "510
 NOT "410和510性能区别", "410和510价格区别".
 6. If the user query is already atomic (asks about exactly one thing), do NOT split it. \
 At most normalize it: convert verbose colloquial expressions into concise standard form.
+7. Every sub-query MUST be self-contained and independently searchable. \
+NEVER use pronouns or references like "这些", "那些", "上述", "它们", "其中", "从结果中". \
+Each sub-query must include all necessary context (brand, category, parameters, price range, etc.).
+8. Sub-queries must be parallelizable with NO dependencies between them. \
+Do NOT split a single condition into "find X" then "check if X meets Y". \
+Instead combine all conditions into one query, e.g. "1匹低端挂机空调 价格1300-1700元".
 
 You MUST respond with a JSON object in the following format:
 {"sub_queries": ["query1", "query2", ...]}
@@ -32,6 +38,9 @@ Output: {"sub_queries": ["410特点", "510特点"]}
 
 User: query: "对比U8Q和小米S pro Mini LED的画质和价格", topk: 2
 Output: {"sub_queries": ["U8Q画质和价格", "小米S pro Mini LED画质和价格"]}
+
+User: query: "适合7-10平米的1匹低端挂机空调 价格1300-1700元", topk: 3
+Output: {"sub_queries": ["1匹低端挂机空调 适合7-10平米 价格1300-1700元"]}
 
 User: query: "你好呀", topk: 3
 Output: {"sub_queries": []}
@@ -97,11 +106,13 @@ DEEP_RESOLVE_PROMPT = """\
 
 规则（必须严格遵守）：
 1. 搜索引擎没有任何记忆，不知道之前搜过什么，所以输出的 query 必须包含所有必要信息。
-2. 禁止出现任何模糊引用，包括但不限于：'初始结果'、'上述'、'前面提到的'、\
-'符合条件的'、'在...范围内'（不带具体数值）、'相关型号'等。
+2. 绝对禁止出现任何指代词或模糊引用，包括但不限于：'这些'、'那些'、'上述'、'前面提到的'、\
+'初始结果'、'符合条件的'、'查询结果中'、'在...范围内'（不带具体数值）、'相关型号'、\
+'这些型号'、'这些产品'、'它们'等。违反此规则视为失败。
 3. 所有引用必须替换为具体的数值、型号名、品牌名、参数值。
 4. 如果已知事实中没有对应的具体值，则删除该限定条件，不要用模糊表述代替。
-5. 只输出改写后的 query 文本，不要解释、不要加引号。
+5. 输出的 query 应该简洁直接，像用户直接在搜索框输入的那样。
+6. 只输出改写后的 query 文本，不要解释、不要加引号。
 
 已知事实（来自前面的搜索结果）:
 %s
@@ -135,6 +146,36 @@ Current search results:
 Respond with a JSON object:
 - If sufficient: {"status": "stop", "summary": "...", "key_facts": ["..."], "references": [...]}
 - If more search needed: {"status": "continue", "summary": "...", "key_facts": ["..."], "references": [...], "next_goal": "what to search next and why"}
+"""
+
+# ── Domain Selection (结构化检索) ──────────────────────────────
+
+RDF_SUMMARIZE_PROMPT = """\
+你是一个 schema 摘要助手。给定一个领域名称和它的 JSON 定义，用一句话概括该领域包含哪些核心实体和属性。
+
+领域名称: %s
+
+JSON 定义:
+%s
+
+请直接输出一句话摘要，不要加任何格式或前缀。
+"""
+
+DOMAIN_SELECT_PROMPT = """\
+你是一个领域分类助手。给定用户查询和一组可用的领域（domain），选出与查询相关的领域。
+
+可用领域及其描述:
+%s
+
+规则:
+1. 只从给定的领域列表中选择，不要编造新领域。
+2. 选出所有与查询相关的领域，可以是一个或多个。
+3. 如果没有任何领域与查询相关，返回空列表。
+
+用户查询: %s
+
+请用 JSON 格式回答:
+{"domains": ["domain1", "domain2"]}
 """
 
 # ── Tool Selection: Graph ───────────────────────────────────────

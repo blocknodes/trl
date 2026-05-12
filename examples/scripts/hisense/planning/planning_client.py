@@ -254,7 +254,7 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
               score_threshold: float, max_top_k: int, tool_hub: str,
               tool_hub_optional: str, search_strategy: str = "broad",
               thinking: str = "simple", tool_select_enable: bool = False,
-              debug: bool = False):
+              debug: bool = False, domains: list[dict] | None = None):
     """循环调用 planning_server /planner，执行搜索，直到 status="stop"。"""
     logger.info("Server: %s", server_url)
     logger.info("Question: %s", question)
@@ -270,23 +270,35 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
             # 构造请求
             payload = {
                 "query": question,
-                "retrieval_setting": {
+                "turn": turn,
+                "max_turn": max_turn,
+                "tool_hub": tool_hub,
+            }
+
+            # 可选参数
+            if domains:
+                payload["domains"] = domains
+            if tool_hub_optional:
+                payload["tool_hub_optional"] = tool_hub_optional
+            if top_k > 0:
+                payload["retrieval_setting"] = {
                     "top_k": top_k,
                     "score_threshold": score_threshold,
                     "search_mode": "hybrid",
-                    "search_strategy": "precise",
-                },
-                "turn": turn,
-                "max_turn": max_turn,
-                "max_top_k": max_top_k,
-                "max_context_size": 3,
-                "tool_hub": tool_hub,
-                "tool_hub_optional": tool_hub_optional,
-                "thinking": thinking,
-                "tool_select_enable": tool_select_enable,
-            }
-            if history:
+                    "search_strategy": search_strategy,
+                }
+            if max_top_k > 0:
+                payload["max_top_k"] = max_top_k
+            if thinking != "simple":
+                payload["thinking"] = thinking
+            if tool_select_enable:
+                payload["tool_select_enable"] = tool_select_enable
+
+            if thinking != "simple" and history:
                 payload["history"] = history
+            elif thinking == "simple" and turn > 1 and f"turn_{turn - 1}" in history:
+                # simple 模式: 只传上一轮的搜索结果，server 内部累积
+                payload["history"] = {f"turn_{turn - 1}": history[f"turn_{turn - 1}"]}
 
             logger.log(VERBOSE, "Request payload:\n%s", json.dumps(payload, ensure_ascii=False, indent=2))
             logger.debug("Request summary: turn=%d, query=%r, tool_hub=%s, tool_hub_optional=%s, "
@@ -312,6 +324,13 @@ async def run(server_url: str, question: str, max_turn: int, top_k: int,
             final = resp_data.get("final")
 
             logger.info("Turn %d | status=%s, is_off_topic=%s", turn, status, is_off_topic)
+
+            # 打印 deep thinking plan
+            plan = resp_data.get("plan")
+            if plan:
+                logger.info("Deep thinking plan (%d steps):", len(plan))
+                for i, s in enumerate(plan):
+                    logger.info("  Step %d: %s (reason: %s)", i + 1, s.get("goal", ""), s.get("reason", ""))
 
             if is_off_topic:
                 logger.info("Off-topic query, skipping retrieval")
@@ -385,6 +404,8 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Print full retrieval results")
     parser.add_argument("--web-backend", default="xiaosu", choices=["bocha", "xiaosu"],
                         help="Web search backend: bocha or xiaosu (default: bocha)")
+    parser.add_argument("--domains", type=str, default="",
+                        help="Domains JSON string, e.g. '[{\"domain\":\"SupplyChain\",\"desc\":\"...\",\"rdf_list\":[...]}]'")
     parser.add_argument("--log-level", default="INFO",
                         choices=["VERBOSE", "DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Console logging level (default: INFO)")
@@ -392,6 +413,15 @@ def main():
                         choices=["VERBOSE", "DEBUG", "INFO", "WARNING", "ERROR"],
                         help="File logging level (default: DEBUG)")
     args = parser.parse_args()
+
+    # 解析 domains JSON
+    domains = None
+    if args.domains:
+        try:
+            domains = json.loads(args.domains)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse --domains JSON: %s", e)
+            sys.exit(1)
 
     import datetime as _dt
     _log_file = f"planning_client_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -418,6 +448,7 @@ def main():
         thinking=args.thinking,
         tool_select_enable=args.tool_select_enable,
         debug=args.debug,
+        domains=domains,
     ))
 
 

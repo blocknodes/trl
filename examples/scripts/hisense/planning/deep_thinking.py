@@ -192,7 +192,7 @@ async def handle_deep_thinking(req, llm_client, llm_model, planner_client, plann
         logger.info("Deep thinking Step 1 | sub_queries=%s", sub_queries)
 
         current_items = [SubQueryItem(sub_query=sq, tool_use=req.tool_hub, topk=req.max_top_k) for sq in sub_queries]
-        return PlanningResponse(is_off_topic=False, status="running", turn=req.turn, current=current_items)
+        return PlanningResponse(is_off_topic=False, status="running", turn=req.turn, current=current_items, plan=steps)
 
     else:
         if session_id not in _deep_sessions:

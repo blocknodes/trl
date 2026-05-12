@@ -39,6 +39,33 @@ def collect_all_results_from_history(history: dict | None, original_query: str =
 
     final: dict[str, list[dict]] = {}
     for tool_type, sq_map in streams_by_tool.items():
+        # graph: 有效 score 的按 top_k 截断，无 score / score=0 的全量保留
+        if tool_type == "graph":
+            scored, unscored = [], []
+            seen_u: set[str] = set()
+            for records in sq_map.values():
+                for r in records:
+                    s = r.get("score", 0)
+                    if isinstance(s, (int, float)) and s > 0:
+                        scored.append(r)
+                    else:
+                        key = r.get("content", "")
+                        if key not in seen_u:
+                            seen_u.add(key)
+                            unscored.append(r)
+            scored.sort(key=lambda r: r.get("score", 0), reverse=True)
+            # 对 scored 部分去重并截断到 top_k
+            picked, seen_s = [], set()
+            for r in scored:
+                key = r.get("content", "")
+                if key not in seen_s:
+                    seen_s.add(key)
+                    picked.append(r)
+                    if len(picked) >= top_k:
+                        break
+            final[tool_type] = picked + unscored
+            continue
+
         sq_keys = list(sq_map.keys())
         if original_query in sq_keys:
             sq_keys.remove(original_query)

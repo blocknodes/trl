@@ -26,11 +26,24 @@ class SubQueryItem(BaseModel):
     sub_query: str
     tool_use: str
     topk: int
+    domain: list[str] | None = None
+
+
+class SubDomainItem(BaseModel):
+    scene: str
+    desc: str = ""
+    info: list[dict] = []
+
+
+class DomainItem(BaseModel):
+    domain: str
+    desc: str = ""
+    rdf_list: list[SubDomainItem] = []
 
 
 class PlanningRequest(BaseModel):
     query: str
-    retrieval_setting: RetrievalSetting
+    retrieval_setting: RetrievalSetting | None = None
     turn: int
     max_turn: int = 3
     max_top_k: int = 3
@@ -42,6 +55,7 @@ class PlanningRequest(BaseModel):
     tool_select_enable: bool = False
     tool_selection_mode: str = "rule"  # "rule" or "model"
     tool_selection_threshold: float | None = None
+    domains: list[DomainItem] | None = None
 
 
 class PlanningResponse(BaseModel):
@@ -51,6 +65,7 @@ class PlanningResponse(BaseModel):
     current: list[SubQueryItem] | None = None
     history: dict | None = None
     final: dict | None = None
+    plan: list[dict] | None = None
     step_summary: str | None = None
     answer: str | None = None
     reference_tree: list | None = None
