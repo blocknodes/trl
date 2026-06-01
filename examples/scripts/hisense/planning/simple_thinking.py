@@ -12,11 +12,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 
 from openai import AsyncOpenAI
 
 from helpers import DomainItem, PlanningResponse, RetrievalSetting, SubQueryItem, _parse_llm_json
+from helpers import extract_entity_tables, build_keywords_from_entity_tables, score_query_against_keywords
 from query_rewrite import rewrite_query
 from prompts import DOMAIN_SELECT_PROMPT, RDF_SUMMARIZE_PROMPT
 from tool_selection import select_optional_tools
@@ -53,8 +55,8 @@ def _cleanup_expired_sessions():
         _simple_sessions.pop(sid, None)
 
 
-# struct/unstruct -> graph/es 别名映射
-_TOOL_ALIAS = {"struct": "graph"}
+# 工具别名映射（保留 unstruct -> es 的兼容别名；struct 和 graph 是两种独立工具）
+_TOOL_ALIAS = {"unstruct": "es"}
 _TOOL_ALIAS_REV = {v: k for k, v in _TOOL_ALIAS.items()}
 
 
@@ -189,6 +191,78 @@ async def _apply_tool_select(ts_client: AsyncOpenAI, ts_model: str, sub_queries:
     return results
 
 
+def _select_tool_by_keyword(query: str, tool_hub_optional: str, domains: list | None,
+                            keyword_threshold: float) -> tuple[str, list[str]]:
+    """基于关键词匹配从 tool_hub_optional 中选择工具。
+
+    工具类型:
+    - struct: 结构化检索（带 domain，由关键词匹配触发）
+    - graph: 查询工具（不带 domain，类似 web）
+    - es: 必选工具（当环境变量 ES_REQUIRED=1 时）
+    - web: fallback 工具
+
+    规则:
+    - 若环境变量 ES_REQUIRED=1 且 tool_hub_optional 含 es，es 必选
+    - 若 tool_hub_optional 含 struct 且关键词命中 → 加上 struct + matched domains
+    - 若 es 和 struct 都不可用/未命中，按优先级 fallback 到 es > graph > web
+    - 若 struct 是唯一选项且未命中，仍使用 struct（带所有 domains）
+
+    返回: (选中的工具字符串, 匹配的 domain 列表; 仅 struct 时有效)
+    """
+    es_required = os.environ.get("ES_REQUIRED", "0") == "1"
+
+    optional_normalized = [_normalize_tool(t.strip()) for t in tool_hub_optional.split(",") if t.strip()]
+
+    # 关键词匹配：判断 struct 是否合适
+    matched_domains: list[str] = []
+    if "struct" in optional_normalized and domains:
+        for domain_item in domains:
+            for sub_domain in domain_item.rdf_list:
+                if sub_domain.info:
+                    entity_tables = extract_entity_tables(sub_domain.info)
+                    if entity_tables:
+                        keywords = build_keywords_from_entity_tables(entity_tables)
+                        hit_ratio, hit_count, token_count, hits = score_query_against_keywords(query, keywords)
+                        logger.info("Keyword tool select: domain=%s, scene=%s, query=%r, "
+                                    "hit_ratio=%.2f, hit_count=%d, token_count=%d, threshold=%.2f, hits=%s",
+                                    domain_item.domain, sub_domain.scene, query,
+                                    hit_ratio, hit_count, token_count, keyword_threshold, hits)
+                        if hit_ratio >= keyword_threshold:
+                            if domain_item.domain not in matched_domains:
+                                matched_domains.append(domain_item.domain)
+
+    # 组装首轮工具：struct（命中时） + es（ES_REQUIRED=1 且 es 在 optional 中时必选）
+    selected: list[str] = []
+    if matched_domains:
+        selected.append("struct")
+    if es_required and "es" in optional_normalized:
+        selected.append("es")
+
+    if selected:
+        tool_use = ",".join(selected)
+        logger.info("Keyword tool select: selected=%s, matched_domains=%s, es_required=%s",
+                    tool_use, matched_domains, es_required)
+        return tool_use, matched_domains
+
+    # ── 未命中且不强制 es：按优先级 fallback (es > graph > web) ──
+    priority_order = ["es", "graph", "web"]
+    available = [t for t in priority_order if t in optional_normalized]
+    available += [t for t in optional_normalized if t not in priority_order and t != "struct"]
+
+    if available:
+        fallback = available[0]
+        logger.info("Keyword tool select: struct not matched, fallback to %s", fallback)
+        return fallback, []
+
+    # 只有 struct 可用，未命中也使用，带所有 domains
+    if "struct" in optional_normalized:
+        all_domains = [d.domain for d in domains] if domains else []
+        logger.info("Keyword tool select: struct not matched but is only option, using all domains=%s", all_domains)
+        return "struct", all_domains
+
+    return "", []
+
+
 async def handle_simple_thinking(req, llm_client: AsyncOpenAI, llm_model: str,
                                  ts_client: AsyncOpenAI | None = None, ts_model: str = "",
                                  ts_threshold: float = 0) -> PlanningResponse:
@@ -231,9 +305,9 @@ async def handle_simple_thinking(req, llm_client: AsyncOpenAI, llm_model: str,
                              tool_use=_restore_tools(it.tool_use, _orig_all),
                              topk=it.topk, domain=it.domain) for it in items]
 
-    # ── 单轮直检快捷路径：tool_hub 为纯 struct 或 unstruct 且 max_turn=1 ──
-    if req.max_turn == 1 and req_tool_hub in ("graph", "es"):
-        is_struct = req_tool_hub == "graph"
+    # ── 单轮直检快捷路径：tool_hub 为纯 struct 或 es 且 max_turn=1 ──
+    if req.max_turn == 1 and req_tool_hub in ("struct", "es"):
+        is_struct = req_tool_hub == "struct"
         tool_label = _restore_tools(req_tool_hub, _orig_all)
 
         sub_queries = await rewrite_query(llm_client, llm_model, req.query, req.max_top_k)
@@ -289,6 +363,25 @@ async def handle_simple_thinking(req, llm_client: AsyncOpenAI, llm_model: str,
             )
             current_items = [SubQueryItem(sub_query=sq, tool_use=th, topk=req.max_top_k)
                              for sq, th in zip(sub_queries, tool_hubs)]
+
+        # ── tool_selection_mode=keyword: 关键词匹配决定工具优先级 ──
+        elif req.tool_selection_mode == "keyword" and not req_tool_hub and req_tool_hub_optional:
+            kw_threshold = float(req.tool_selection_threshold) if req.tool_selection_threshold is not None else 0.5
+            selected_tool, matched_domains = _select_tool_by_keyword(
+                req.query, req_tool_hub_optional, req.domains, kw_threshold,
+            )
+            if selected_tool:
+                # 若选中工具含 struct 且有 matched_domains，附上 domain 字段
+                tool_set = {t.strip() for t in selected_tool.split(",") if t.strip()}
+                use_domain = matched_domains if "struct" in tool_set and matched_domains else None
+                current_items = [SubQueryItem(sub_query=sq, tool_use=selected_tool, topk=req.max_top_k,
+                                             domain=use_domain) for sq in sub_queries]
+            else:
+                # 无可用工具，fallback 到所有 optional
+                current_items = [SubQueryItem(sub_query=sq, tool_use=req_tool_hub_optional, topk=req.max_top_k)
+                                 for sq in sub_queries]
+            logger.info("Turn 1 | keyword mode: selected_tool=%s, matched_domains=%s",
+                         selected_tool, matched_domains)
 
         # ── tool_selection_mode=model (旧逻辑，tool_select_enable=False) ──
         elif req.tool_selection_mode == "model" and req_tool_hub_optional:
@@ -366,6 +459,45 @@ async def handle_simple_thinking(req, llm_client: AsyncOpenAI, llm_model: str,
                             topk=min(item["topk"], req.max_top_k),
                         ))
                 logger.info("Turn %d | model mode, per-subquery tool_hubs=%s", req.turn, tool_hubs)
+
+        elif req.tool_selection_mode == "keyword" and req_tool_hub_optional and req.turn < req.max_turn:
+            # keyword 模式非首轮：检查 struct 是否已有结果，有则直接 stop
+            has_struct_results = False
+            if history:
+                for turn_key in history.values():
+                    for item in turn_key.get("retrieval_contents", []):
+                        for tool_type, records in item.get("result", {}).items():
+                            if tool_type == "struct" and records:
+                                has_struct_results = True
+                                break
+
+            if has_struct_results:
+                # struct 有结果，直接 stop，不再补充其他工具
+                final = collect_all_results_from_history(history, original_query=req.query, top_k=top_k)
+                logger.info("Turn %d | keyword mode: struct has results, stop.", req.turn)
+                _simple_sessions.pop(session_id, None)
+                return PlanningResponse(
+                    is_off_topic=False, status="stop", turn=req.turn, final=final,
+                    history=trim_history(history, req.max_context_size),
+                )
+
+            # struct 无结果，使用所有 tool_hub_optional + 所有 domains（仅给 struct）
+            all_tools = req_tool_hub_optional
+            all_domains = [d.domain for d in req.domains] if req.domains else []
+            all_items = get_sub_queries_with_used_tools(history)
+            for item in all_items:
+                used = item["used_tools"]
+                all_tool_set = {t.strip() for t in all_tools.split(",") if t.strip()}
+                new_tools = all_tool_set - used
+                if new_tools:
+                    current_items.append(SubQueryItem(
+                        sub_query=item["sub_query"],
+                        tool_use=",".join(sorted(new_tools)),
+                        topk=min(item["topk"], req.max_top_k),
+                        domain=all_domains if "struct" in new_tools else None,
+                    ))
+            logger.info("Turn %d | keyword mode fallback: all tools=%s, all domains=%s",
+                         req.turn, all_tools, all_domains)
 
         elif req.tool_selection_mode == "rule" and req_tool_hub_optional and req.turn < req.max_turn:
             optional_tools = {_normalize_tool(t.strip()) for t in req_tool_hub_optional.split(",") if t.strip()}

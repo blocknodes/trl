@@ -216,8 +216,8 @@ async def web_search(query: str, topk: int = 10) -> list[dict]:
 
 async def execute_search(sub_query: str, tool_use: str, topk: int, search_strategy: str = "broad") -> dict:
     """对一个 sub_query 执行指定工具的搜索，返回 planning 协议格式的结果。"""
-    # struct/unstruct 是 graph/es 的别名
-    _alias = {"struct": "graph", "unstruct": "es"}
+    # unstruct 是 es 的别名（struct 和 graph 是两种独立工具）
+    _alias = {"unstruct": "es"}
     tools = [t.strip() for t in tool_use.split(",") if t.strip()]
     result: dict[str, list[dict]] = {}
 
@@ -231,8 +231,8 @@ async def execute_search(sub_query: str, tool_use: str, topk: int, search_strate
         elif canonical == "web":
             tasks.append(web_search(sub_query, topk=topk))
             tool_names.append(tool)
-        elif canonical == "graph":
-            # graph 暂未实现，直接置空
+        elif canonical in ("struct", "graph"):
+            # struct/graph 暂未实现，直接置空
             result[tool] = []
 
     if tasks:

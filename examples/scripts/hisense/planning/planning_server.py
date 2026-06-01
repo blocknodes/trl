@@ -18,10 +18,16 @@ import json
 import logging
 import os
 
+import jieba
+
 from fastapi import FastAPI
 from openai import AsyncOpenAI
 
-from helpers import VERBOSE, PlanningRequest, PlanningResponse, RetrievalSetting
+from helpers import (
+    VERBOSE, PlanningRequest, PlanningResponse, RetrievalSetting,
+    extract_entity_tables, build_keywords_from_entity_tables,
+    score_query_against_keywords, STOPWORDS,
+)
 from workflow import trim_history
 
 logger = logging.getLogger("planning_server")
@@ -32,6 +38,7 @@ app = FastAPI(title="Planning Server")
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 _llm_client: AsyncOpenAI | None = None
 _llm_model: str = ""
@@ -52,6 +59,38 @@ async def planner(req: PlanningRequest):
                  req.turn, req.query, req.tool_hub, req.tool_hub_optional,
                  rs.score_threshold, rs.top_k,
                  req.max_top_k, req.thinking)
+
+    # ── 从 domains.rdf_list.info 中提取实体表并记录到日志 ──
+    if req.domains:
+        for domain_item in req.domains:
+            for sub_domain in domain_item.rdf_list:
+                if sub_domain.info:
+                    entity_tables = extract_entity_tables(sub_domain.info)
+                    if entity_tables:
+                        logger.info("Domain=%s, Scene=%s: Extracted %d entity tables",
+                                    domain_item.domain, sub_domain.scene, len(entity_tables))
+                        for entity_name, attrs in entity_tables.items():
+                            attr_lines = "\n".join(
+                                f"    - {a['label']} ({a['property_name']}) [{a['type']}]: {a['comment']}"
+                                for a in attrs
+                            )
+                            logger.info("Entity [%s]:\n%s", entity_name, attr_lines)
+
+                        # 提取关键词集合并记录到日志
+                        keywords = build_keywords_from_entity_tables(entity_tables)
+                        logger.info("Domain=%s, Scene=%s: Keywords (%d):\n    %s",
+                                    domain_item.domain, sub_domain.scene, len(keywords),
+                                    ", ".join(sorted(keywords)))
+
+                        # 对 query 进行关键词匹配打分
+                        kw_threshold = float(req.tool_selection_threshold) if req.tool_selection_threshold is not None else 0.5
+                        hit_ratio, hit_count, token_count, hits = score_query_against_keywords(req.query, keywords)
+                        matched = hit_ratio >= kw_threshold
+                        # 打印分词结果
+                        tokens = [t for t in jieba.lcut(req.query) if len(t) >= 2 and t not in STOPWORDS]
+                        logger.info("Domain=%s, Scene=%s: Query=%r, tokens=%s, hit_ratio=%.2f, hit_count=%d, token_count=%d, threshold=%.2f, matched=%s, hits=%s",
+                                    domain_item.domain, sub_domain.scene, req.query, tokens,
+                                    hit_ratio, hit_count, token_count, kw_threshold, matched, hits)
 
     _handlers = {
         "deep": ("deep_thinking", "handle_deep_thinking"),
@@ -76,7 +115,12 @@ async def planner(req: PlanningRequest):
     logger.log(VERBOSE, "Response output:\n%s", json.dumps(resp.model_dump(), ensure_ascii=False, indent=2, default=str))
     current_summary = ""
     if resp.current:
-        parts = [f"({c.sub_query} -> [{c.tool_use}] topk={c.topk})" for c in resp.current]
+        parts = []
+        for c in resp.current:
+            if c.tool_use == "struct" and c.domain:
+                parts.append(f"({c.sub_query} -> [{c.tool_use}] topk={c.topk} domain={c.domain})")
+            else:
+                parts.append(f"({c.sub_query} -> [{c.tool_use}] topk={c.topk})")
         current_summary = ", ".join(parts)
     final_tools = list(resp.final.keys()) if resp.final else []
     logger.debug("Response summary: status=%s, turn=%d, current=[%s], final_tools=%s",

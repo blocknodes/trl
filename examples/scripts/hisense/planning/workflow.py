@@ -39,31 +39,23 @@ def collect_all_results_from_history(history: dict | None, original_query: str =
 
     final: dict[str, list[dict]] = {}
     for tool_type, sq_map in streams_by_tool.items():
-        # graph: 有效 score 的按 top_k 截断，无 score / score=0 的全量保留
-        if tool_type == "graph":
-            scored, unscored = [], []
+        # struct/graph: 全量保留（每路 sub_query 都保留，不受 top_k 截断）
+        if tool_type in ("struct", "graph"):
+            all_records: list[dict] = []
             seen_u: set[str] = set()
             for records in sq_map.values():
                 for r in records:
-                    s = r.get("score", 0)
-                    if isinstance(s, (int, float)) and s > 0:
-                        scored.append(r)
+                    # struct 用 subQuery/sparqlResult 去重，graph 用 content 去重
+                    if tool_type == "struct":
+                        key = r.get("subQuery", "") or r.get("sparqlResult", "")
                     else:
                         key = r.get("content", "")
-                        if key not in seen_u:
-                            seen_u.add(key)
-                            unscored.append(r)
-            scored.sort(key=lambda r: r.get("score", 0), reverse=True)
-            # 对 scored 部分去重并截断到 top_k
-            picked, seen_s = [], set()
-            for r in scored:
-                key = r.get("content", "")
-                if key not in seen_s:
-                    seen_s.add(key)
-                    picked.append(r)
-                    if len(picked) >= top_k:
-                        break
-            final[tool_type] = picked + unscored
+                    if not key:
+                        all_records.append(r)
+                    elif key not in seen_u:
+                        seen_u.add(key)
+                        all_records.append(r)
+            final[tool_type] = all_records
             continue
 
         sq_keys = list(sq_map.keys())
@@ -132,7 +124,10 @@ def get_sub_queries_with_used_tools(history: dict | None) -> list[dict]:
 
 
 def count_total_qualified(history: dict | None, score_threshold: float) -> int:
-    """统计 history 中所有达到 score_threshold 的结果总数。"""
+    """统计 history 中所有达到 score_threshold 的结果总数。
+
+    仅对 es 生效，struct/graph/web 等其他工具结果不参与计数。
+    """
     count = 0
     if not history:
         return count
@@ -140,6 +135,8 @@ def count_total_qualified(history: dict | None, score_threshold: float) -> int:
         turn_data = history[turn_key]
         for item in turn_data.get("retrieval_contents", []):
             for tool_type, records in item.get("result", {}).items():
+                if tool_type != "es":
+                    continue
                 for r in records:
                     score = r.get("score", 0)
                     if isinstance(score, (int, float)) and score >= score_threshold:
